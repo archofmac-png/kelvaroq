@@ -1,0 +1,96 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index df00645..36e666a 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -2456,7 +2456,7 @@ impl Shadow {
+     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
+     pub(crate) fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
+-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
++        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len, true);
+         // Not a copy: not counted with them, and nothing asks what the
+         // title wrote there.
+         LIVE[0].fetch_sub(1, Ordering::Relaxed);
+@@ -2474,8 +2474,9 @@ impl Shadow {
+         list.defer_refresh(self, address as usize, len as usize);
+     }
+ 
+-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+-        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
++    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, in_place: bool) -> Shadow {
++        // A placed resource shares title bytes: no generations to refresh.
++        let pages = if in_place { 0 } else { (start + len).div_ceil(PAGE as u64) - start / PAGE as u64 };
+         LIVE[0].fetch_add(1, Ordering::Relaxed);
+         LIVE[1].fetch_add(len, Ordering::Relaxed);
+         Shadow {
+@@ -3770,7 +3771,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+             crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} in CPU-visible card memory", key.0));
+             // SAFETY: a live buffer.
+             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+-            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
++            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len, false);
+             shadow.rebar = true;
+             entry.shadow = Some(Arc::new(shadow));
+             return entry.shadow.clone();
+@@ -3817,7 +3818,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+                 "buffer copied to the host"
+             );
+         }
+-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
++        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len, false);
+         shadow.card = card;
+         let shadow = Arc::new(shadow);
+         if shadow.card.is_some() {
+@@ -4009,7 +4010,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
+         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in CPU-visible card memory"));
+         // SAFETY: a live buffer.
+         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+-        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
++        let mut shadow = Shadow::new(buffer, data, gpu, start, len, false);
+         shadow.window = true;
+         shadow.rebar = true;
+         let shadow = Arc::new(shadow);
+@@ -4043,7 +4044,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
+         len,
+         "loose memory copied to the host"
+     );
+-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
++    let mut shadow = Shadow::new(buffer, data, gpu, start, len, false);
+     shadow.window = true;
+     shadow.card = card;
+     let shadow = Arc::new(shadow);
+@@ -4108,7 +4109,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+     // SAFETY: a live buffer.
+     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
++    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len, false));
+     map.insert((address, len), (shadow.clone(), now));
+     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+     Some(shadow)
+@@ -4246,6 +4247,16 @@ mod card_merge_tests {
+     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+     use windows::Win32::Graphics::Dxgi::*;
+ 
++    #[test]
++    fn placed_views_have_no_copy_generations_but_fallbacks_cover_edge_pages() {
++        let Some(buffer) = warp_buffer() else { return };
++        let start = 65535;
++        let direct = Shadow::new(buffer.clone(), std::ptr::null_mut(), 0, start, 2, true);
++        let copied = Shadow::new(buffer, std::ptr::null_mut(), 0, start, 2, false);
++        assert_eq!(direct.copied.lock().unwrap().capacity(), 0);
++        assert_eq!(&*copied.copied.lock().unwrap(), &[0, 0]);
++    }
++
+     /// A plain buffer on the software adapter: what a copy's `buffer` and
+     /// its card's `staging` are; the merge never touches them.
+     fn warp_buffer() -> Option<ID3D12Resource> {
+@@ -4303,7 +4314,7 @@ mod card_merge_tests {
+             // The title's byte, refreshed into the CPU's side and sent up in send 7.
+             title[title_byte] ^= 0x5a;
+             side[title_byte] = title[title_byte];
+-            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
++            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64, false);
+             shadow.card = Some(Card {
+                 small_readonly: false,
+                 staging: staging.clone(),
