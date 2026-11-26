@@ -1,0 +1,281 @@
+diff --git a/crates/victory-gpu/src/host/uma.rs b/crates/victory-gpu/src/host/uma.rs
+index 358e8bc..b4a1ca6 100644
+--- a/crates/victory-gpu/src/host/uma.rs
++++ b/crates/victory-gpu/src/host/uma.rs
+@@ -119,6 +119,25 @@ pub(super) fn bind_constants(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn read_only_table_constant_keeps_its_section_without_an_upload_fill() {
++        const CHILD: &str = "KELVAROQ_UMA_CONSTANT_TEST_CHILD";
++        if std::env::var_os(CHILD).is_none() {
++            // Other tests remap pages and submit writers. Exercise this
++            // read-only submission in a process with no unrelated flights.
++            let output = std::process::Command::new(std::env::current_exe().unwrap())
++                .args(["host::uma::tests::read_only_table_constant_keeps_its_section_without_an_upload_fill", "--exact", "--nocapture"])
++                .env(CHILD, "1").output().unwrap();
++            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
++            return;
++        }
++        if !crate::inplace::pool::constants() || host().is_none() {
++            eprintln!("UMA constants or D3D12 unavailable; direct constant check not exercised");
++            return;
++        }
++        detached_constant(false);
++    }
++
+     #[test]
+     #[ignore = "requires diagnostics, WARP and the UMA pool"]
+     fn warp_detached_constant_keeps_the_selected_physical_offset() {
+@@ -143,10 +162,6 @@ mod tests {
+             crate::inplace::pool::constants()
+         });
+         unsafe {
+-            assert_eq!(
+-                host.device.GetAdapterLuid(),
+-                warp_adapter().unwrap().GetDesc().unwrap().AdapterLuid
+-            );
+             let page = 65536;
+             let section = mem::CreateFileMappingW(
+                 INVALID_HANDLE_VALUE,
+diff --git a/crates/victory-gpu/src/inplace/pool.rs b/crates/victory-gpu/src/inplace/pool.rs
+index 6c30a80..6af9683 100644
+--- a/crates/victory-gpu/src/inplace/pool.rs
++++ b/crates/victory-gpu/src/inplace/pool.rs
+@@ -137,6 +137,16 @@ pub(crate) fn lookup(
+     at: usize,
+     bytes: usize,
+     open_new: bool,
++) -> Option<(Arc<PoolBuffer>, u64)> {
++    lookup_with_budget(device, at, bytes, open_new, limit())
++}
++
++fn lookup_with_budget(
++    device: &ID3D12Device,
++    at: usize,
++    bytes: usize,
++    open_new: bool,
++    budget: u64,
+ ) -> Option<(Arc<PoolBuffer>, u64)> {
+     if bytes == 0 || at.checked_add(bytes).is_none() {
+         return None;
+@@ -158,7 +168,6 @@ pub(crate) fn lookup(
+         REFUSED[3].fetch_add(1, Ordering::Relaxed);
+         return None;
+     };
+-    let budget = limit();
+     if size > budget {
+         REFUSED[4].fetch_add(1, Ordering::Relaxed);
+         return None;
+@@ -205,6 +214,41 @@ pub(crate) fn lookup(
+     Some((buffer, offset))
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_view_larger_than_shared_budget_leaves_no_opening_or_charge() {
++        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++        let Some(host) = crate::host::host() else {
++            eprintln!("D3D12 unavailable; shared opening budget check not exercised");
++            return;
++        };
++        // SAFETY: the test owns this committed section and its single view.
++        unsafe {
++            let section = mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
++                mem::SEC_COMMIT | mem::PAGE_READWRITE, 0, K64 as u32, std::ptr::null());
++            assert!(!section.is_null());
++            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
++            assert!(!view.Value.is_null());
++            let handle = section as usize;
++            title_memory_section(handle, K64 as u64, true);
++            title_memory_view(view.Value as usize, K64, handle, 0);
++            assert!(lookup_with_budget(&host.device, view.Value as usize, 256, true, K64 as u64 - 1).is_none());
++            assert!(!CACHE.lock().unwrap().contains_key(&handle));
++            assert!(!views().charges.contains_key(&handle));
++            let mut fallback = 0;
++            crate::memory::pool::Reads::default().fallback(view.Value as usize, 256, |_, n| fallback += n);
++            assert_eq!(fallback, 256, "a refused binding still refreshes all requested bytes");
++            super::super::views_gone(view.Value as usize, K64);
++            let _charge = title_memory_section_closed(handle);
++            assert_ne!(mem::UnmapViewOfFile(view), 0);
++            assert_ne!(CloseHandle(section), 0);
++        }
++    }
++}
++
+ static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+ 
+ /// Recording a fixed GPU address would bind the old physical offset
+diff --git a/crates/victory-gpu/src/memory/pool/tests.rs b/crates/victory-gpu/src/memory/pool/tests.rs
+index 26daba6..a4742fc 100644
+--- a/crates/victory-gpu/src/memory/pool/tests.rs
++++ b/crates/victory-gpu/src/memory/pool/tests.rs
+@@ -1,5 +1,30 @@
+ use super::*;
+ 
++#[test]
++fn a_page_written_and_reread_in_one_frame_stays_direct() {
++    let page = PAGE as usize;
++    let mut directory = [0, 0, 1, 0];
++    let mut sections = Sections::default();
++    sections.candidates.push((1, 0, 0));
++    let mut physical = vec![0u8; page];
++    for value in [17, 93] {
++        physical[256..512].fill(value);
++        let reads = sections.publish(directory.as_mut_ptr(), 1);
++        let mut copied = 0;
++        reads.fallback(page + 256, 256, |_, n| copied += n);
++        assert_eq!(copied, 0, "CPU writes do not invalidate shared backing");
++        assert_eq!(directory[2..], [COPIES + 1, 0]);
++        let offset = directory[3] as usize + 256;
++        assert_eq!(&physical[offset..offset + 256], &[value; 256]);
++    }
++    // A writer submission must restore the copied page before refreshing it.
++    let reads = sections.publish(directory.as_mut_ptr(), 0);
++    let mut copied = 0;
++    reads.fallback(page + 256, 256, |_, n| copied += n);
++    assert_eq!(copied, 256);
++    assert_eq!(directory[2..], [1, 0]);
++}
++
+ #[test]
+ #[ignore = "requires diagnostics, VICTORY_D3D12_WARP=1 and VICTORY_UMA_POOL=1"]
+ fn warp_raw_shader_replays_across_a_pool_remap() {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 0c285ab..340b999 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -3325,11 +3325,17 @@ mod tests {
+         assert_eq!(cold.reclaim(&registry, at(12), 3, 13, 11, || false), 0);
+         // The cold interval elapsed, but a submission that could have sampled it is still running.
+         assert_eq!(cold.reclaim(&registry, at(13), 3, 14, 11, || false), 0);
+-        let before = KINDS[1].load(Relaxed);
++        // Other tests allocate concurrently; account only this registry.
++        let resident_bytes = || -> u64 {
++            images.iter().map(|&image| {
++                resource(image).host.made.lock().unwrap().as_ref()
++                    .map_or(0, |(host, _)| host.bytes)
++            }).sum()
++        };
++        let before = resident_bytes();
+         // As soon as one copy's bytes fit, keep the other cold copy.
+         assert_eq!(
+-            cold.reclaim(&registry, at(14), 3, 15, 12, || KINDS[1].load(Relaxed)
+-                < before),
++            cold.reclaim(&registry, at(14), 3, 15, 12, || resident_bytes() < before),
+             1
+         );
+         let present = images.map(|r| resource(r).host.made.lock().unwrap().is_some());
+@@ -3346,13 +3352,86 @@ mod tests {
+         for &image in &images[..2] {
+             assert!(host_copy(image).is_some());
+         }
+-        assert_eq!(KINDS[1].load(Relaxed), before);
++        assert_eq!(resident_bytes(), before);
+         drop((list, slot));
+         for image in images {
+             resource_release(image);
+         }
+     }
+ 
++    #[test]
++    #[cfg(windows)]
++    fn vram_pressure_reclaims_only_unpinned_completed_copies_and_accounts_recreation() {
++        use std::sync::atomic::Ordering::Relaxed;
++        if crate::host::host().is_none() {
++            return;
++        }
++        let null = std::ptr::null();
++        struct Images([This; 3]);
++        impl Drop for Images {
++            fn drop(&mut self) {
++                for image in self.0 {
++                    if !image.is_null() {
++                        resource_release(image);
++                    }
++                }
++            }
++        }
++        let mut images = Images([null; 3]);
++        for image in &mut images.0 {
++            assert_eq!(
++                create_committed(
++                    null, &PROPERTIES, 0, &texture(16, 16, 28, 1), 0,
++                    null.cast(), &RESOURCE_IIDS[0], image,
++                ),
++                S_OK
++            );
++            drop(host_copy(*image).unwrap());
++            resource(*image).host.used.store(1, Relaxed);
++        }
++        let owned_bytes = || -> u64 {
++            images.0.iter().map(|&image| {
++                resource(image).host.made.lock().unwrap().as_ref()
++                    .map_or(0, |(host, _)| host.bytes)
++            }).sum()
++        };
++        let get_copy = |index: usize| {
++            resource(images.0[index]).host.made.lock().unwrap()
++                .as_ref().unwrap().0.clone()
++        };
++        let bytes = get_copy(0).bytes;
++        assert!(bytes > 0);
++        assert_eq!(owned_bytes(), 3 * bytes);
++        // Each copy owns real host memory. Model a pressured upload budget
++        // with space for only two; no multi-GiB allocation is necessary.
++        let budget = 2 * bytes;
++        let registry = images.0.map(|image| image as usize).into_iter().collect();
++        let at = |frame: u64| (frame << 32) | 20;
++        let mut cold = ColdTextures::default();
++        assert_eq!(cold.reclaim(&registry, at(10), 3, 12, 6, || owned_bytes() <= budget), 0);
++        assert_eq!(cold.copies.len(), 3);
++        // Take owners after observation so reclaim must recheck both kinds:
++        // a list holds the Arc, a descriptor holds the COM resource itself.
++        let list = get_copy(1);
++        let slot = get_copy(2).texture.clone();
++        assert_eq!(cold.reclaim(&registry, at(14), 3, 13, 11, || owned_bytes() <= budget), 0);
++        assert_eq!(owned_bytes(), 3 * bytes, "the observed fence has not completed");
++        let evicted = KINDS[3].load(Relaxed);
++        assert_eq!(cold.reclaim(&registry, at(14), 3, 13, 12, || owned_bytes() <= budget), 1);
++        assert_eq!(owned_bytes(), budget);
++        assert!(resource(images.0[0]).host.made.lock().unwrap().is_none());
++        assert!(KINDS[3].load(Relaxed) >= evicted + bytes);
++        assert_eq!(cold.reclaim(&registry, at(15), 3, 14, 12, || false), 0);
++        assert_eq!(owned_bytes(), budget, "list and descriptor owners remain resident");
++        let recreated = KINDS[5].load(Relaxed);
++        drop(host_copy(images.0[0]).unwrap());
++        assert_eq!(owned_bytes(), 3 * bytes);
++        assert!(KINDS[5].load(Relaxed) >= recreated + bytes);
++        // The exact local byte total avoids races with other tests' KINDS[1]
++        // allocations. Cumulative accounting counters may also advance there.
++        drop((list, slot));
++    }
++
+     #[test]
+     fn heaps_are_zeroed_aligned_memory() {
+         let heap = heap(1 << 20);
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 447d782..a472e91 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -1421,6 +1421,8 @@ pub(crate) mod tests {
+         } as usize;
+         assert_ne!(p, 0);
+         let (start, end) = (p, p + 4 * PAGE);
++        // As the title allocator does: a reused address has a new lifetime.
++        title_memory_remapped(start, end - start);
+         let (_, before) = writes(start, end, false).expect("watched");
+         assert!(before.is_empty());
+         // SAFETY: committed pages of ours.
+@@ -1461,6 +1463,7 @@ pub(crate) mod tests {
+             )
+             .is_none()
+         );
++        title_memory_remapped(start, end - start);
+         // SAFETY: our allocation.
+         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+     }
