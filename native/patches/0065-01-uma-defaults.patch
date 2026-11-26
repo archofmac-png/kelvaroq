@@ -1,0 +1,48 @@
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 7c60946..c1f8d7f 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -95,11 +95,11 @@ pub(crate) fn level() -> u8 {
+ 
+ /// Approach after XCL f3b15b9: bind a buffer over committed title pages.
+ /// The census found private buffers small enough to keep in system memory.
+-/// Keep the experimental policy independent of the older placement modes.
++/// Enabled by default; VICTORY_UMA=0 keeps the legacy copy policy.
+ pub(crate) fn private_reads() -> bool {
+     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ENABLED.get_or_init(|| {
+-        std::env::var_os("VICTORY_UMA").is_some_and(|v| v == "1")
++        std::env::var_os("VICTORY_UMA").is_none_or(|v| v != "0")
+             && std::env::var_os("VICTORY_UMA_PRIVATE").is_none_or(|v| v == "1")
+     })
+ }
+@@ -108,7 +108,7 @@ pub(crate) fn private_reads() -> bool {
+ /// The hardware probe found opening itself costly, so measure it separately.
+ pub(crate) fn private_constants() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| private_reads() && std::env::var_os("VICTORY_UMA_PRIVATE_CBV").is_some_and(|v| v == "1"))
++    *ON.get_or_init(|| private_reads() && std::env::var_os("VICTORY_UMA_PRIVATE_CBV").is_none_or(|v| v != "0"))
+ }
+ 
+ /// The most title memory in place at once, in bytes
+diff --git a/crates/victory-gpu/src/inplace/pool.rs b/crates/victory-gpu/src/inplace/pool.rs
+index 3313224..6c30a80 100644
+--- a/crates/victory-gpu/src/inplace/pool.rs
++++ b/crates/victory-gpu/src/inplace/pool.rs
+@@ -60,12 +60,13 @@ impl Drop for PoolCommit {
+     }
+ }
+ 
+-/// Openable physical sections are opt-in because Windows charges them at allocation.
++/// Default to openable sections within the commit and opening budgets.
++/// VICTORY_UMA=0 restores reserved sections and the legacy copy path.
+ pub fn uma_pool() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+     *ON.get_or_init(|| {
+-        std::env::var_os("VICTORY_UMA").is_some_and(|v| v == "1")
+-            && std::env::var_os("VICTORY_UMA_POOL").is_some_and(|v| v == "1")
++        std::env::var_os("VICTORY_UMA").is_none_or(|v| v != "0")
++            && std::env::var_os("VICTORY_UMA_POOL").is_none_or(|v| v != "0")
+     })
+ }
+ 
