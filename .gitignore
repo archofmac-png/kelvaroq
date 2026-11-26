@@ -11,3 +11,5 @@ __pycache__/
 *.xvd
 /local/
 /captures/
+/bench/out/
+/bench/heavy.local.psd1
