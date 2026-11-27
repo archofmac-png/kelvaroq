@@ -9,9 +9,16 @@ Broader diagnostics depth-bounds/stack-walker issues from 0065 remain unresolved
 Current response and checks: [Lane A round 2](docs/uma-0066.md).
 External-data measurement protocol remains in [0065](docs/uma-0065.md).
 Removal preservation is opt-in; live title resume remains unsupported.
-Removal checks and limits: [0068](docs/removal-0068.md); suspended forensic capture only.
+Removal checks and limits: [0069](docs/removal-0069.md); suspended forensic capture only.
 
 ## Sessions
+
+### 2026-11-26 (5) — Repaired forensic deadline arithmetic and hashing
+<!-- session: lane-a-0069-20261126-c728 -->
+- DONE: Patch 0069; 66 root, 282 GPU, 113 HLE, 43 loader tests; production check and series match. [Evidence](docs/removal-0069.md).
+- DECIDED: 300 ms floor; measured startup; separate read-back hash budget; work/parent/helper deadlines B-200/B-125/B-25 ms.
+- UNVERIFIED: Title frame cost and arbitrary OS stalls; no live resume.
+- NEXT: Measure title inventory and matched flag-off/on frame costs before enablement.
 
 ### 2026-11-26 (4) — Bounded suspended forensic capture and real removal dispatch
 <!-- session: lane-a-0068-20261126-91bf -->

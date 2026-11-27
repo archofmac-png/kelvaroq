@@ -1,0 +1,589 @@
+diff --git a/README.md b/README.md
+index 81d057f..d29bcaa 100644
+--- a/README.md
++++ b/README.md
+@@ -252,19 +252,30 @@ on a surviving title/frame thread. Guard flags are removed only in the clone.
+ 
+ Every generation starts with a flushed `PARTIAL` marker. A loader must reject
+ that marker even if `COMPLETE` exists, and reject every `.partial` directory.
+-Each artifact is hashed while written; the `COMPLETE` manifest is written last,
+-then the directory is renamed and `PARTIAL` removed. There is no exit-time
+-artifact readback: verify hashes offline before using forensic evidence. A failed
++Each artifact is written and flushed, then read back and hashed under the work
++deadline. The `COMPLETE` manifest is written last, then the directory is renamed
++and `PARTIAL` removed. Verify hashes offline before using forensic evidence. A failed
+ or externally killed capture keeps its partial generation and all older ones.
+ 
+-The shared monotonic deadline starts at helper launch: 2,000 ms by default.
+-`VICTORY_RECOVERY_BUDGET_MS` can select 50–10,000 ms. A dedicated watchdog in
+-each process enforces it even if clone, read, flush or logging stalls, or the
+-helper dies. Before cloning, an estimate includes readable committed RAM and
+-save/storage file sizes: 250 ms + bytes / 64 MiB/s. This is a conservative
+-admission policy, not measured throughput; oversize work exits early. Deadline
+-exit is `0xE0680002`. Configure below the external watchdog; an external kill
+-before our deadline can still interrupt any stage and cannot be prevented.
++The shared monotonic clock starts before helper process creation: 2,000 ms by
++default; `VICTORY_RECOVERY_BUDGET_MS` is clamped to 300-10,000 ms. Relative to
++that start, work expires at budget minus 200 ms, the parent watchdog terminates
++the target at budget minus 125 ms, and the helper's fallback exits at budget
++minus 25 ms. The helper also exits when the parent process signals termination.
++Thus the parent owns hard target termination, with a 100 ms lead over the helper.
++`PARTIAL` is flushed before suspension or capture; deadline handling never needs
++to create it. The work cutoff leaves 75 ms before parent termination for reporting.
++
++Before cloning, readable committed RAM and save/storage sizes are admitted only
++when the work allowance covers **measured process creation/worker startup +
++50 ms setup + bytes / 64 MiB/s copy + bytes / 64 MiB/s read-back hashing**,
++plus elapsed worker time. Startup includes logger initialization. The zero-byte
++floor invariant is 300 ms > 200 ms reserves + 50 ms setup; slow startup can still
++exhaust the remaining 50 ms at the minimum. Both byte rates are admission policies,
++not measured throughput. `estimate.txt` records every line; refusal states the
++invariant. Deadline exit is `0xE0680002`. Fixed margins tolerate bounded skew,
++timer resolution and termination delay, not arbitrary scheduler or I/O stalls.
++Configure below the external watchdog; an earlier external kill cannot be prevented.
+ 
+ These are **FORENSIC ONLY**, never loadable save states. The RAM file header
+ (`SCARLRAM2FORENSIC_ONLY\n`) and each generation's README say so. Suspension
+@@ -292,6 +303,8 @@ finishes within budget; a hard deadline can leave only `PARTIAL`. Keep all
+ generations and never copy partial files over live saves. With the flag off,
+ legacy handling remains. WARP reconstruction is an isolated no-title probe,
+ not evidence of live title resume.
++Logging is initialized before worker entry. The helper appends and flushes JSON
++directly to the parent's configured crash-log path, independent of tracing.
+ 
+ What each part does today and what it still needs:
+ 
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 9aea9fe..d89cf87 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -141,9 +141,9 @@ enum Console {
+ }
+ 
+ fn main() -> Result<()> {
++    victory_core::logging::init("info");
+     #[cfg(windows)]
+     victory_loader::recovery::worker::worker();
+-    victory_core::logging::init("info");
+     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+     #[cfg(all(windows, feature = "diagnostics"))]
+     if victory_hle::modules::audio::capture::child() {
+diff --git a/crates/victory-loader/src/recovery.rs b/crates/victory-loader/src/recovery.rs
+index 7ec565d..47fde17 100644
+--- a/crates/victory-loader/src/recovery.rs
++++ b/crates/victory-loader/src/recovery.rs
+@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
+ 
+ pub mod worker;
+ pub const RAM_HEADER: &[u8] = b"SCARLRAM2FORENSIC_ONLY\n";
+-const FORENSIC: &str = "FORENSIC ONLY; never a loadable save state. All title threads are suspended before cloning/copy. Suspension is sequential and can interrupt updates: object graphs, allocator metadata, descriptors, command/fence bookkeeping and save buffers may already be inconsistent. Non-cloneable/inaccessible pages, OS handles and GPU-only state are absent. External processes, kernel I/O and shared mappings may still change. RAM and committed saves are not an atomic checkpoint. COMPLETE contains streaming hashes, not read-back verification. Verify offline before using any artifact. PARTIAL always means incomplete.\n";
++const FORENSIC: &str = "FORENSIC ONLY; never a loadable save state. All title threads are suspended before cloning/copy. Suspension is sequential and can interrupt updates: object graphs, allocator metadata, descriptors, command/fence bookkeeping and save buffers may already be inconsistent. Non-cloneable/inaccessible pages, OS handles and GPU-only state are absent. External processes, kernel I/O and shared mappings may still change. RAM and committed saves are not an atomic checkpoint. COMPLETE contains hashes read back from written files. Verify offline before using any artifact. PARTIAL always means incomplete.\n";
++const SETUP_MS: u64 = 50;
+ fn invalid(what: &str) -> io::Error {
+     io::Error::other(what)
+ }
+@@ -17,30 +18,39 @@ fn invalid(what: &str) -> io::Error {
+ pub struct Budget {
+     start: Instant,
+     limit: Duration,
++    startup: Duration,
+ }
+ impl Budget {
+     pub fn new(limit: Duration) -> Self {
++        Self::with_startup(limit, Duration::ZERO)
++    }
++    fn with_startup(limit: Duration, startup: Duration) -> Self {
+         Self {
+             start: Instant::now(),
+             limit,
++            startup,
+         }
+     }
+     pub fn check(&self) -> io::Result<()> {
+-        if self.start.elapsed() >= self.limit {
++        if self.startup.saturating_add(self.start.elapsed()) >= self.limit {
+             Err(io::Error::new(io::ErrorKind::TimedOut, "snapshot deadline"))
+         } else {
+             Ok(())
+         }
+     }
+-    // Conservative policy estimate, not a throughput claim: 64 MiB/s plus 250 ms.
++    // Startup is measured from before CreateProcess, not silently free. Copy and
++    // read-back hashing have separate 64 MiB/s policy lines (not measured rates).
+     pub fn admit(&self, bytes: u64) -> io::Result<()> {
+-        self.check()?;
+-        if estimate(bytes) > self.limit.saturating_sub(self.start.elapsed()) {
++        let required = self.startup.saturating_add(estimate(bytes));
++        let remaining = self.limit.saturating_sub(self.start.elapsed());
++        if required > remaining {
+             return Err(io::Error::new(
+                 io::ErrorKind::TimedOut,
+                 format!(
+-                    "snapshot estimate {} ms for {bytes} bytes exceeds remaining budget",
+-                    estimate(bytes).as_millis()
++                    "snapshot admission invariant: remaining work allowance ({remaining:?}) >= measured startup ({:?}) + setup ({SETUP_MS} ms) + copy ({} ms) + read-back hash ({} ms); required {required:?} for {bytes} bytes; watchdog reserves are excluded from the work allowance",
++                    self.startup,
++                    pass_ms(bytes),
++                    pass_ms(bytes)
+                 ),
+             ));
+         }
+@@ -48,10 +58,13 @@ impl Budget {
+     }
+ }
+ fn estimate(bytes: u64) -> Duration {
+-    Duration::from_millis(250u64.saturating_add(bytes.saturating_mul(1000).div_ceil(64 << 20)))
++    Duration::from_millis(SETUP_MS.saturating_add(pass_ms(bytes).saturating_mul(2)))
++}
++fn pass_ms(bytes: u64) -> u64 {
++    bytes.saturating_mul(1000).div_ceil(64 << 20)
+ }
+ 
+-/// One pass: hash exactly the bytes successfully written. No on-exit readback.
++/// Write and flush first, then hash the written file under the same work deadline.
+ fn write_hashed(
+     file: &Path,
+     budget: &Budget,
+@@ -59,7 +72,6 @@ fn write_hashed(
+ ) -> io::Result<(u64, blake3::Hash)> {
+     struct Checked<'a> {
+         file: File,
+-        hash: blake3::Hasher,
+         bytes: u64,
+         budget: &'a Budget,
+     }
+@@ -67,7 +79,6 @@ fn write_hashed(
+         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+             self.budget.check()?;
+             let n = self.file.write(bytes)?;
+-            self.hash.update(&bytes[..n]);
+             self.bytes += n as u64;
+             Ok(n)
+         }
+@@ -78,7 +89,6 @@ fn write_hashed(
+     budget.check()?;
+     let mut out = Checked {
+         file: OpenOptions::new().write(true).create_new(true).open(file)?,
+-        hash: blake3::Hasher::new(),
+         bytes: 0,
+         budget,
+     };
+@@ -86,7 +96,24 @@ fn write_hashed(
+     budget.check()?;
+     out.file.sync_all()?;
+     budget.check()?;
+-    Ok((out.bytes, out.hash.finalize()))
++    let mut input = File::open(file)?;
++    let mut hash = blake3::Hasher::new();
++    let mut buffer = vec![0; 1 << 20];
++    let mut hashed = 0u64;
++    loop {
++        budget.check()?;
++        let n = input.read(&mut buffer)?;
++        if n == 0 {
++            break;
++        }
++        hash.update(&buffer[..n]);
++        hashed += n as u64;
++    }
++    budget.check()?;
++    if hashed != out.bytes {
++        return Err(invalid("artifact length changed during read-back hashing"));
++    }
++    Ok((out.bytes, hash.finalize()))
+ }
+ 
+ pub struct Generation {
+@@ -115,17 +142,10 @@ impl Generation {
+             .open(path.join("PARTIAL"))?;
+         marker.write_all(b"FORENSIC_ONLY: capture incomplete; reject even if COMPLETE exists\n")?;
+         marker.sync_all()?;
+-        let mut readme = OpenOptions::new()
+-            .create_new(true)
+-            .write(true)
+-            .open(path.join("README.txt"))?;
+-        readme.write_all(FORENSIC.as_bytes())?;
+-        readme.sync_all()?;
+-        let manifest = format!(
+-            "SCARLETT_FORENSIC_MANIFEST_2\n{} {} \"README.txt\"\n",
+-            blake3::hash(FORENSIC.as_bytes()),
+-            FORENSIC.len()
+-        );
++        let (bytes, digest) = write_hashed(&path.join("README.txt"), &budget, |out| {
++            out.write_all(FORENSIC.as_bytes())
++        })?;
++        let manifest = format!("SCARLETT_FORENSIC_MANIFEST_2\n{digest} {bytes} \"README.txt\"\n");
+         Ok(Self {
+             path,
+             budget,
+@@ -405,18 +425,22 @@ mod tests {
+         assert!(failed.path.join("PARTIAL").exists());
+     }
+     #[test]
+-    fn streaming_manifest_matches_independent_offline_hash() {
++    fn readback_manifest_matches_independent_offline_hash() {
+         let root = tempfile::tempdir().unwrap();
+         let mut generation =
+             Generation::begin(root.path(), Budget::new(Duration::from_secs(5))).unwrap();
++        let written = generation.path.join("data");
+         generation
+             .write(Path::new("data"), |out| {
+                 out.write_all(b"one")?;
+-                out.write_all(b"two")
++                out.write_all(b"two")?;
++                // Prove the digest reads the file rather than the write buffer.
++                fs::write(&written, b"ONDISK")
+             })
+             .unwrap();
+         let complete = generation.finish().unwrap();
+         let bytes = fs::read(complete.join("data")).unwrap();
++        assert_eq!(bytes, b"ONDISK");
+         assert!(
+             fs::read_to_string(complete.join("COMPLETE"))
+                 .unwrap()
+@@ -426,14 +450,17 @@ mod tests {
+     }
+     #[test]
+     fn size_estimate_and_expired_budget_reject_work() {
+-        assert_eq!(estimate(64 << 20), Duration::from_millis(1250));
++        assert_eq!(estimate(0), Duration::from_millis(50));
++        assert_eq!(estimate(64 << 20), Duration::from_millis(2050));
+         assert!(
+             Budget::new(Duration::from_millis(100))
+                 .admit(64 << 20)
+                 .is_err()
+         );
+         let root = tempfile::tempdir().unwrap();
+-        let mut generation = Generation::begin(root.path(), Budget::new(Duration::ZERO)).unwrap();
++        let mut generation =
++            Generation::begin(root.path(), Budget::new(Duration::from_secs(5))).unwrap();
++        generation.budget = Budget::new(Duration::ZERO);
+         assert!(
+             generation
+                 .write(Path::new("data"), |w| w.write_all(b"no"))
+diff --git a/crates/victory-loader/src/recovery/worker.rs b/crates/victory-loader/src/recovery/worker.rs
+index 02ada86..dc8e417 100644
+--- a/crates/victory-loader/src/recovery/worker.rs
++++ b/crates/victory-loader/src/recovery/worker.rs
+@@ -10,6 +10,50 @@ pub const DEADLINE_EXIT: u32 = 0xe0680002;
+ const INCOMPLETE_EXIT: u32 = 0xe0670002;
+ const COMPLETE_EXIT: u32 = 0xe0670001;
+ const CHILD: &str = "SCARLETT_RECOVERY_WORKER";
++const MIN_BUDGET_MS: u64 = 300;
++const PARENT_MARGIN_MS: u64 = 125;
++const CHILD_MARGIN_MS: u64 = 25;
++const WORK_MARGIN_MS: u64 = 175;
++
++#[derive(Debug)]
++struct Deadlines {
++    work: u64,
++    parent: u64,
++    child: u64,
++}
++impl Deadlines {
++    fn new(started: u64, millis: u64) -> Self {
++        let end = started.saturating_add(millis);
++        Self {
++            work: end.saturating_sub(CHILD_MARGIN_MS + WORK_MARGIN_MS),
++            parent: end.saturating_sub(PARENT_MARGIN_MS),
++            child: end.saturating_sub(CHILD_MARGIN_MS),
++        }
++    }
++}
++fn configured_budget(value: Option<&str>) -> u64 {
++    value
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(2000)
++        .clamp(MIN_BUDGET_MS, 10_000)
++}
++fn ticks() -> u64 {
++    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
++    #[cfg(test)]
++    if std::env::var_os(CHILD).is_some() {
++        return now.saturating_add_signed(number::<i64>("SCARLETT_0069_CLOCK_SKEW").unwrap_or(0));
++    }
++    now
++}
++fn sleep_until(deadline: u64) {
++    loop {
++        let remaining = deadline.saturating_sub(ticks());
++        if remaining == 0 {
++            return;
++        }
++        unsafe { Sleep(remaining.min(u32::MAX as u64) as u32) };
++    }
++}
+ 
+ pub struct Request {
+     pub root: PathBuf,
+@@ -28,13 +72,10 @@ pub struct Request {
+ /// launches before suspension, then performs no more capture work in the title.
+ /// Returns only on launch failure; successful helper owns target termination.
+ pub fn launch(request: Request) -> io::Result<()> {
+-    let millis = std::env::var("VICTORY_RECOVERY_BUDGET_MS")
+-        .ok()
+-        .and_then(|v| v.parse::<u64>().ok())
+-        .unwrap_or(2000)
+-        .clamp(50, 10_000);
+-    let deadline = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+-        .saturating_add(millis);
++    let millis = configured_budget(std::env::var("VICTORY_RECOVERY_BUDGET_MS").ok().as_deref());
++    let started = ticks();
++    let deadlines = Deadlines::new(started, millis);
++    let parent_deadline = deadlines.parent;
+     // Independent fallback covers a blocked CreateProcess or helper startup.
+     // Keep this watchdog runnable after suspension; the helper also has one.
+     let (tx, rx) = std::sync::mpsc::sync_channel(0);
+@@ -42,15 +83,16 @@ pub fn launch(request: Request) -> io::Result<()> {
+         .name("recovery-start-deadline".into())
+         .spawn(move || {
+             let _ = tx.send(unsafe { GetCurrentThreadId() });
+-            unsafe {
+-                Sleep(millis as u32);
+-            }
++            // Absolute time includes watchdog thread creation and the rendezvous.
++            sleep_until(parent_deadline);
+             unsafe {
+                 TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
+             }
+         })?;
+     let watchdog_tid = rx
+-        .recv_timeout(Duration::from_millis(millis))
++        .recv_timeout(Duration::from_millis(
++            parent_deadline.saturating_sub(ticks()),
++        ))
+         .unwrap_or_else(|_| {
+             unsafe {
+                 TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
+@@ -73,7 +115,8 @@ pub fn launch(request: Request) -> io::Result<()> {
+         .env("SCARLETT_RECOVERY_SAVES", request.saves)
+         .env("SCARLETT_RECOVERY_STORAGE", request.storage)
+         .env("SCARLETT_RECOVERY_LOG", request.log)
+-        .env("SCARLETT_RECOVERY_DEADLINE", deadline.to_string())
++        .env("SCARLETT_RECOVERY_STARTED", started.to_string())
++        .env("SCARLETT_RECOVERY_BUDGET", millis.to_string())
+         .env(
+             "SCARLETT_RECOVERY_DISPATCHES",
+             request.dispatches.to_string(),
+@@ -150,7 +193,7 @@ fn parent_is(pid: u32) -> bool {
+     }
+ }
+ 
+-/// Call before tracing/CLI startup. Never returns in a worker. Test children
++/// Call after logging initialization, before CLI startup. Never returns in a worker. Test children
+ /// invoke the very same function before their fixture body.
+ pub fn worker() {
+     let Ok(pid) = number::<u32>(CHILD) else {
+@@ -166,7 +209,8 @@ pub fn worker() {
+                 | PROCESS_VM_OPERATION
+                 | PROCESS_DUP_HANDLE
+                 | PROCESS_CREATE_PROCESS
+-                | PROCESS_TERMINATE,
++                | PROCESS_TERMINATE
++                | PROCESS_SYNCHRONIZE,
+             0,
+             pid,
+         )
+@@ -177,9 +221,16 @@ pub fn worker() {
+     if process_created(target).ok() != number::<u64>("SCARLETT_RECOVERY_PARENT_CREATED").ok() {
+         std::process::exit(2);
+     }
+-    let deadline = number::<u64>("SCARLETT_RECOVERY_DEADLINE").unwrap_or(0);
+-    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+-    let remaining = Duration::from_millis(deadline.saturating_sub(now));
++    let started = number::<u64>("SCARLETT_RECOVERY_STARTED").unwrap_or(0);
++    let millis = number::<u64>("SCARLETT_RECOVERY_BUDGET").unwrap_or(0);
++    let deadlines = Deadlines::new(started, millis);
++    let startup = Duration::from_millis(ticks().saturating_sub(started));
++    // Charge time from before CreateProcess, including logging initialization,
++    // exactly once. Watchdog startup below also consumes this work allowance.
++    let budget = Budget::with_startup(
++        Duration::from_millis(deadlines.work.saturating_sub(started)),
++        startup,
++    );
+     #[cfg(test)]
+     fs::write(
+         root_for_test().join("worker.pid"),
+@@ -187,13 +238,32 @@ pub fn worker() {
+     )
+     .unwrap();
+     let raw = target as usize;
+-    // No heap, filesystem, CRT exit or target locks once this deadline fires.
++    // Parent owns hard target termination, 100 ms before the child hard deadline.
++    // Observe its exit without needing a helper write or target-owned lock.
+     let watchdog = std::thread::Builder::new()
+         .name("capture-hard-deadline".into())
+         .spawn(move || {
+-            std::thread::sleep(remaining);
++            loop {
++                let remaining = deadlines.child.saturating_sub(ticks());
++                if remaining == 0
++                    || unsafe {
++                        WaitForSingleObject(raw as HANDLE, remaining.min(u32::MAX as u64) as u32)
++                    } != WAIT_TIMEOUT
++                {
++                    break;
++                }
++            }
++            #[cfg(test)]
++            {
++                let mut exit = 259;
++                unsafe { GetExitCodeProcess(raw as HANDLE, &mut exit) };
++                let _ = fs::write(
++                    root_for_test().join("watchdog-target-exit"),
++                    exit.to_string(),
++                );
++            }
++            // Production hard-exit path performs no filesystem/CRT cleanup.
+             unsafe {
+-                TerminateProcess(raw as HANDLE, DEADLINE_EXIT);
+                 TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
+             }
+         });
+@@ -203,7 +273,6 @@ pub fn worker() {
+         }
+         std::process::exit(2);
+     }
+-    let budget = Budget::new(remaining);
+     let root = path("SCARLETT_RECOVERY_ROOT").unwrap_or_default();
+     let mut folder = root.clone();
+     let mut artifacts = Vec::new();
+@@ -224,9 +293,14 @@ pub fn worker() {
+         generation.write(Path::new("estimate.txt"), |out| {
+             writeln!(
+                 out,
+-                "bytes={size} policy_ms={} budget_ms={}",
+-                estimate(size).as_millis(),
+-                remaining.as_millis()
++                "bytes={size} startup_ms={} setup_ms={SETUP_MS} copy_ms={} hash_readback_ms={} policy_ms={} budget_ms={millis} work_ms={} parent_ms={} child_ms={}",
++                startup.as_millis(),
++                pass_ms(size),
++                pass_ms(size),
++                startup.saturating_add(estimate(size)).as_millis(),
++                deadlines.work.saturating_sub(started),
++                deadlines.parent.saturating_sub(started),
++                deadlines.child.saturating_sub(started)
+             )
+         })?;
+         budget.admit(size)?;
+@@ -492,7 +566,7 @@ fn exercise_test_faults(target: HANDLE, generation: &mut Generation) -> io::Resu
+         .unwrap_or_default()
+         .as_str()
+     {
+-        "stall" => unsafe {
++        "stall" | "clock_skew_fast" | "clock_skew_slow" => unsafe {
+             Sleep(30_000);
+         },
+         "helper_death" => unsafe {
+@@ -508,6 +582,54 @@ mod tests {
+     use super::*;
+     const TEST: &str = "recovery::worker::tests::suspended_capture_and_hard_deadlines";
+     #[test]
++    fn budget_floor_admits_zero_bytes_and_charges_measured_startup() {
++        assert_eq!(configured_budget(Some("50")), 300);
++        assert_eq!(configured_budget(Some("10001")), 10_000);
++        assert_eq!(configured_budget(Some("invalid")), 2000);
++        for millis in MIN_BUDGET_MS..=10_000 {
++            let deadlines = Deadlines::new(0, millis);
++            let work = Duration::from_millis(deadlines.work);
++            assert!(
++                estimate(0) < work,
++                "zero-byte admission must be reachable at {millis} ms"
++            );
++        }
++        let work = Duration::from_millis(Deadlines::new(0, MIN_BUDGET_MS).work);
++        Budget::with_startup(work, Duration::from_millis(25))
++            .admit(0)
++            .unwrap();
++        let error = Budget::with_startup(work, Duration::from_millis(75))
++            .admit(0)
++            .unwrap_err();
++        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
++        let error = error.to_string();
++        for field in [
++            "invariant",
++            "measured startup",
++            "setup",
++            "copy",
++            "read-back hash",
++            "watchdog reserves",
++        ] {
++            assert!(error.contains(field), "{error}");
++        }
++    }
++    #[test]
++    fn deadline_margins_order_work_parent_child_even_with_clock_skew() {
++        // Opposing 15 ms clock offsets, a full 16 ms timer tick and 25 ms
++        // termination latency still leave the parent ahead of the child.
++        for millis in MIN_BUDGET_MS..=10_000 {
++            let started = 123_456;
++            let deadlines = Deadlines::new(started, millis);
++            assert!(started < deadlines.work && deadlines.work < deadlines.parent);
++            assert!(deadlines.parent < deadlines.child && deadlines.child < started + millis);
++            let parent_latest = deadlines.parent + 15 + 16 + 25;
++            let child_earliest = deadlines.child - 15;
++            assert!(parent_latest < child_earliest);
++            assert!(parent_latest < started + millis);
++        }
++    }
++    #[test]
+     fn suspended_capture_and_hard_deadlines() {
+         worker();
+         if let Some(root) = std::env::var_os("SCARLETT_0068_FIXTURE") {
+@@ -559,6 +681,8 @@ mod tests {
+             ("size", 1000, DEADLINE_EXIT),
+             ("stall", 1000, DEADLINE_EXIT),
+             ("helper_death", 1000, DEADLINE_EXIT),
++            ("clock_skew_fast", 1000, DEADLINE_EXIT),
++            ("clock_skew_slow", 1000, DEADLINE_EXIT),
+         ] {
+             let root = tempfile::tempdir().unwrap();
+             let mut child = Command::new(std::env::current_exe().unwrap())
+@@ -567,6 +691,14 @@ mod tests {
+                 .env("SCARLETT_0068_MODE", mode)
+                 .env("SCARLETT_RECOVERY_TEST_ENTRY", TEST)
+                 .env("VICTORY_RECOVERY_BUDGET_MS", millis.to_string())
++                .env(
++                    "SCARLETT_0069_CLOCK_SKEW",
++                    match mode {
++                        "clock_skew_fast" => "15",
++                        "clock_skew_slow" => "-15",
++                        _ => "0",
++                    },
++                )
+                 .env_remove(CHILD)
+                 .spawn()
+                 .unwrap();
+@@ -603,7 +735,7 @@ mod tests {
+                 assert!(folder.join("PARTIAL").exists());
+                 assert!(!folder.join("COMPLETE").exists());
+                 assert!(
+-                    started.elapsed() < Duration::from_millis(millis + 2000),
++                    started.elapsed() < Duration::from_millis(millis),
+                     "budget not bounded: {:?}",
+                     started.elapsed()
+                 );
+@@ -628,8 +760,22 @@ mod tests {
+                 }
+                 assert_ne!(exit, 259, "orphan helper in {mode}");
+             }
++            if mode != "success" {
++                assert!(
++                    started.elapsed() < Duration::from_millis(millis),
++                    "target/helper cleanup exceeded budget in {mode}: {:?}",
++                    started.elapsed()
++                );
++            }
++            if matches!(mode, "stall" | "clock_skew_fast" | "clock_skew_slow") {
++                assert_eq!(
++                    fs::read_to_string(root.path().join("watchdog-target-exit")).unwrap(),
++                    DEADLINE_EXIT.to_string(),
++                    "parent must finish termination before the helper watchdog exits in {mode}"
++                );
++            }
+             eprintln!(
+-                "0068 {mode}: target/helper terminated in {:?}",
++                "0069 {mode}: target/helper terminated in {:?}",
+                 started.elapsed()
+             );
+         }
