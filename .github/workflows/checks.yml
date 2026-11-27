@@ -65,7 +65,7 @@ jobs:
           # Launcher suites: preflight gate, log rotation, and every step of a data move and restore.
           cargo build --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          foreach ($s in 'preflight','logs','moveSteps','restoreFails','move','clear','archive','session','recovery') {
+          foreach ($s in 'preflight','firstrun','logs','moveSteps','restoreFails','move','clear','archive','session','recovery') {
             ./target/debug/kelvaroq-desktop.exe --self-test $s
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }

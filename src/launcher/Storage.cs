@@ -103,29 +103,36 @@ internal static class Files {
 /// Approach after XCL 817328d: decode XML before interpreting executable entries.
 internal sealed class Installation {
     internal string Root, Image;
+    /// The Scarlett executables the MicrosoftGame.Config in this exact folder declares, as full paths
+    /// (declared, not checked for existence). Null when the folder has no MicrosoftGame.Config.
+    internal static HashSet<string> Declared(string folder) {
+        string config = Path.Combine(folder,"MicrosoftGame.Config");
+        if (!File.Exists(config)) return null;
+        var options = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = 4 * 1024 * 1024 };
+        XDocument doc;
+        try { using (var r = XmlReader.Create(config,options)) doc = XDocument.Load(r); }
+        catch (XmlException) { throw new Problem("badManifest"); }
+        var names = new HashSet<string>(Files.Names);
+        foreach (var list in doc.Root.Elements().Where(e => e.Name.LocalName == "ExecutableList")) {
+            foreach (var entry in list.Elements().Where(e => e.Name.LocalName == "Executable")) {
+                var family = (string)entry.Attribute("TargetDeviceFamily");
+                if (family != null && !Files.Names.Equals(family,"Scarlett")) continue;
+                var name = (string)entry.Attribute("Name");
+                if (String.IsNullOrEmpty(name) || !Files.Names.Equals(Path.GetExtension(name),".exe")) throw new Problem("badManifest");
+                foreach (var part in name.Replace('/','\\').Split('\\')) if (part != ".") Files.ValidPart(part);
+                names.Add(Path.GetFullPath(Path.Combine(folder,name)));
+            }
+        }
+        return names;
+    }
     internal static Installation Select(string selection) {
         string path = Files.Full(selection);
         bool folder = Directory.Exists(path);
         if (!folder && (!File.Exists(path) || !Files.Names.Equals(Path.GetExtension(path),".exe"))) throw new Problem("selectExe");
         var parent = new DirectoryInfo(folder ? path : Path.GetDirectoryName(path));
         while (parent != null) {
-            string config = Path.Combine(parent.FullName,"MicrosoftGame.Config");
-            if (File.Exists(config)) {
-                var options = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = 4 * 1024 * 1024 };
-                XDocument doc;
-                try { using (var r = XmlReader.Create(config,options)) doc = XDocument.Load(r); }
-                catch (XmlException) { throw new Problem("badManifest"); }
-                var names = new HashSet<string>(Files.Names);
-                foreach (var list in doc.Root.Elements().Where(e => e.Name.LocalName == "ExecutableList")) {
-                    foreach (var entry in list.Elements().Where(e => e.Name.LocalName == "Executable")) {
-                        var family = (string)entry.Attribute("TargetDeviceFamily");
-                        if (family != null && !Files.Names.Equals(family,"Scarlett")) continue;
-                        var name = (string)entry.Attribute("Name");
-                        if (String.IsNullOrEmpty(name) || !Files.Names.Equals(Path.GetExtension(name),".exe")) throw new Problem("badManifest");
-                        foreach (var part in name.Replace('/','\\').Split('\\')) if (part != ".") Files.ValidPart(part);
-                        names.Add(Path.GetFullPath(Path.Combine(parent.FullName,name)));
-                    }
-                }
+            var names = Declared(parent.FullName);
+            if (names != null) {
                 if (folder && names.Count > 1) throw new Problem("ambiguous");
                 string exe = folder ? names.FirstOrDefault() : path;
                 if (exe == null || !names.Contains(exe) || !File.Exists(exe)) throw new Problem("wrongExe");

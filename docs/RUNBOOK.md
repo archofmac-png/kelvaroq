@@ -35,9 +35,10 @@ of the *runtime* are safe to use; a single small `.exe` claiming to install the 
 1. Extract the runtime somewhere short, e.g. `C:\vt`. Long paths break `blake3`'s build script
    with `A1009: line too long` even with long paths enabled.
 2. Point the config at the game directory. Nothing about the title belongs in the repo.
-3. Precompile before playing: `translate --cache --pipelines`. This is minutes to hours and is
-   the difference between playing and watching dropped draws.
-4. First run only: expect a long shader warm. Leave it.
+3. Run `kelvaroq-desktop.exe --first-run <game folder or exe>` (section 2c). It does the precompile
+   for you, in the right order, and refuses to launch on a cold cache. This is minutes to hours and
+   is the difference between playing and watching dropped draws.
+4. First run only: expect a long shader warm. Leave it. Ctrl+C is safe; run the same command again.
 
 ## 2b. Preflight and doctor
 
@@ -53,6 +54,26 @@ prints which checks it overrode.
 `kelvaroq-desktop.exe --doctor [exe-or-folder]` runs every check, prints a table, never launches,
 and exits 0 (nothing blocks) or 2 (something blocks). The launcher is a windows-subsystem exe, so
 a shell does not wait for it: use `Start-Process -Wait -PassThru` or `cmd /c start /wait`.
+
+## 2c. First run
+
+`kelvaroq-desktop.exe --first-run [folder-or-exe]` (no argument: the executable saved in settings).
+The launcher is a windows-subsystem exe: use `Start-Process -Wait -PassThru` to get the exit code.
+
+1. Resolve: a folder resolves to the one executable `MicrosoftGame.Config` declares for Scarlett.
+   Zero or several declared is a refusal that names them; pass the executable you mean.
+2. Preflight, the same checks as `--doctor`, before the cache is touched. A cold cache is shown but
+   is not what stops it; every other blocking check is. `VICTORY_SKIP_PREFLIGHT=1` works as usual.
+3. Precompile: translate every shader, then queue and build the pipelines. Progress and an ETA from
+   the rate this run measured. Finished steps are recorded in `<cache>\first-run-v1.json`.
+4. Verify with the check `bench/heavy.ps1` uses (file checks, then `precompile --check` must say 0).
+   A cold result refuses to launch.
+5. Launch, once.
+
+A second run on a warm cache does 1, 2 and 4 and launches; it compiles nothing and writes nothing.
+Nothing in the cache is ever deleted. Exit codes: 0 launched, game exited clean | 1 unexpected |
+2 refused before any work | 3 cache still cold (not launched) | 4 an engine step failed |
+5 game exited non-zero | 130 interrupted. 3, 4 and 130 resume on the next run.
 
 ## 3. Failure modes
 

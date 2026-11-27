@@ -7,7 +7,7 @@ using System.Text;
 
 namespace Kelvaroq {
 internal static class Checks {
-    static void Check(bool ok) { if (!ok) throw new InvalidOperationException("Assertion failed"); }
+    internal static void Check(bool ok) { if (!ok) throw new InvalidOperationException("Assertion failed"); }
     static void HardwareProfiles(string home,Preferences prefs) {
         var locale = new Locale("en");
         var machine = Hardware.Sample();
@@ -71,7 +71,7 @@ internal static class Checks {
         }
     }
     // ---- preflight fixtures: empty placeholder files only, no title data ----
-    static readonly DateTime FixtureNow = new DateTime(2026,11,26,12,0,0,DateTimeKind.Utc);
+    internal static readonly DateTime FixtureNow = new DateTime(2026,11,26,12,0,0,DateTimeKind.Utc);
     static PreflightFacts Healthy(string root) {
         string dir = Files.Unique(root), game = Path.Combine(dir,"title"), cache = Path.Combine(dir,"cache");
         Directory.CreateDirectory(Path.Combine(cache,"pipelines","warm-v1")); Directory.CreateDirectory(Path.Combine(cache,"shaders"));
@@ -182,7 +182,7 @@ internal static class Checks {
         try { Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT","1"); Check(Preflight.Doctor(blocked,new StringWriter()) == 2); }
         finally { Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT",env); }
     }
-    static void Reject(Action action) {
+    internal static void Reject(Action action) {
         try { action(); } catch (Exception ex) {
             if (ex is Problem || ex is InvalidDataException || ex is IOException || ex is ArgumentException) return;
             throw;
@@ -199,6 +199,9 @@ internal static class Checks {
                 break;
             case "preflight":
                 RunPreflight(root);
+                break;
+            case "firstrun":
+                FirstRunChecks.Run(root);
                 break;
             case "releases":
                 const string fixture = "{\"tag_name\":\"v0.10.1\",\"body\":\"## Changes\\r\\n- Faster startup\",\"html_url\":\"https://example.invalid/\",\"draft\":false,\"prerelease\":false}";

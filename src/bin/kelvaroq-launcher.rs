@@ -395,6 +395,10 @@ mod launcher {
             desktop_test("preflight");
         }
         #[test]
+        fn first_run_resolves_resumes_and_never_launches_cold() {
+            desktop_test("firstrun");
+        }
+        #[test]
         fn release_tags_and_notes() {
             desktop_test("releases");
         }

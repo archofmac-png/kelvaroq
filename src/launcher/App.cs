@@ -96,6 +96,7 @@ internal static class App {
         bool demo = args.Length > 0 && args[0] == "--ui-demo";
         bool test = args.Length == 2 && args[0] == "--self-test";
         bool doctor = args.Length >= 1 && args[0] == "--doctor";
+        bool firstRun = args.Length >= 1 && args[0] == "--first-run";
         string home = demo || test ? Files.Unique(Path.GetTempPath()) :
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"Kelvaroq");
         try {
@@ -109,6 +110,8 @@ internal static class App {
                 var prefs = demo ? new Preferences { data = Path.Combine(home,"sample-data"), cache = Path.Combine(home,"sample-cache") } : Preferences.Load(home);
                 locale = new Locale(prefs.language);
                 if (!demo) Archives.Recover(prefs.ActiveData,Path.Combine(home,"snapshots"));
+                // Under the session lock: two first-runs must not precompile into one cache.
+                if (firstRun) { Preflight.OpenOutput(); return FirstRunCommand.Run(args,home,prefs,locale); }
                 var window = new Shell(home,prefs,demo,args.Contains("--experimental-render"));
                 if (demo && args.Length == 3 && args[1] == "--capture") { window.Capture(args[2]); return 0; }
                 var selections = args.Where(a => a != "--experimental-render" && a != "--ui-demo").ToArray();
@@ -118,7 +121,7 @@ internal static class App {
                 return window.ExitStatus;
             }
         } catch (Exception ex) {
-            if (test || doctor || (demo && args.Length > 1)) Console.Error.WriteLine(ex);
+            if (test || doctor || firstRun || (demo && args.Length > 1)) Console.Error.WriteLine(ex);
             else MessageBox.Show(locale.Error(ex),"Kelvaroq",MessageBoxButton.OK,MessageBoxImage.Error);
             return 1;
         } finally { if (demo || test) Files.RemoveTree(home); }

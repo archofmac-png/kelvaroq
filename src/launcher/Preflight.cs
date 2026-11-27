@@ -176,7 +176,7 @@ internal static class Preflight {
             string why = ColdReason(f.CacheDir);
             return why == null ? Make("pipelineCache","Pipeline cache",false,PreflightLevel.Pass,"warm (file checks)")
                 : Make("pipelineCache","Pipeline cache",false,PreflightLevel.Block,"pipeline cache is cold: " + why +
-                    ". Fix: run 'translate --cache --pipelines' (docs/RUNBOOK.md section 2) and retry.");
+                    ". Fix: run 'kelvaroq-desktop.exe --first-run' (docs/RUNBOOK.md section 2c) and retry.");
         }));
         list.Add(Guarded("engineRunning","Other engine running",false,() => f.Engines.Count == 0
             ? Make("engineRunning","Other engine running",false,PreflightLevel.Pass,"none")
@@ -209,7 +209,7 @@ internal static class Preflight {
 
     /// Mirrors bench/heavy.ps1 Test-WarmCache file checks. Returns null when warm.
     /// It does not run 'precompile --check' (that needs the engine; see the doctor limits in the report).
-    static string ColdReason(string cache) {
+    internal static string ColdReason(string cache) {
         if (String.IsNullOrEmpty(cache) || !Directory.Exists(cache)) return "cache directory not found: '" + cache + "'";
         foreach (string d in new[]{"pipelines","shaders"})
             if (!Directory.Exists(Path.Combine(cache,d))) return "no '" + d + "' directory in the cache";
@@ -269,7 +269,7 @@ internal static class Preflight {
 
     /// The launcher is a windows-subsystem exe: with no inherited stdout, attach to the parent console.
     /// A redirected stdout (pipe or file) is used as is.
-    static void OpenOutput() {
+    internal static void OpenOutput() {
         IntPtr h = GetStdHandle(-11);
         if (h == IntPtr.Zero || h == new IntPtr(-1)) {
             if (!AttachConsole(0xFFFFFFFF)) return;
