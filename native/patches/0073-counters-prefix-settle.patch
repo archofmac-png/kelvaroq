@@ -12,8 +12,140 @@ index 9fb54f9..ef42f5f 100644
                          match self.heap_buffers(list) {
                              Some(gpu) => {
                                  self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+diff --git a/crates/victory-gpu/src/fence.rs b/crates/victory-gpu/src/fence.rs
+index bf3e699..b3f1cbf 100644
+--- a/crates/victory-gpu/src/fence.rs
++++ b/crates/victory-gpu/src/fence.rs
+@@ -155,7 +155,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
+             let result = loop {
+                 // A bottom-of-pipe write can also update the mapped fence
+                 // word directly, without going through set().
+-                match unsafe { WaitForSingleObject(ready, 4) } {
++                let result = {
++                    let _blocked = crate::frame_wait::title_block(crate::frame_wait::Block::Fence);
++                    unsafe { WaitForSingleObject(ready, 4) }
++                };
++                match result {
+                     WAIT_OBJECT_0 => break S_OK,
+                     WAIT_TIMEOUT if fence.value.load(Ordering::Acquire) < value => continue,
+                     WAIT_TIMEOUT => break S_OK,
+diff --git a/crates/victory-gpu/src/frame_wait.rs b/crates/victory-gpu/src/frame_wait.rs
+index 5e0ca06..67f9bd8 100644
+--- a/crates/victory-gpu/src/frame_wait.rs
++++ b/crates/victory-gpu/src/frame_wait.rs
+@@ -166,15 +166,110 @@ pub(crate) fn during<T>(next: Stage, f: impl FnOnce() -> T) -> T {
+ 
+ /// Only a contended queue, flight or submission lock starts a timer.
+ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    lock_title(mutex, Block::Value)
++}
++
++pub(crate) fn lock_title<T>(mutex: &Mutex<T>, kind: Block) -> MutexGuard<'_, T> {
+     match mutex.try_lock() {
+         Ok(guard) => guard,
+         Err(TryLockError::Poisoned(e)) => e.into_inner(),
+         Err(TryLockError::WouldBlock) => during(Stage::Lock, || {
++            let _blocked = title_block(kind);
+             mutex.lock().unwrap_or_else(|e| e.into_inner())
+         }),
+     }
+ }
+ 
++/// Cumulative nanoseconds: one relaxed add per completed wait, no log resets,
++/// locks or allocation. Convert the total, rather than truncating every wait.
++pub(crate) struct WaitCounter(AtomicU64);
++
++impl WaitCounter {
++    pub(crate) const fn new() -> Self {
++        Self(AtomicU64::new(0))
++    }
++
++    pub(crate) fn micros(&self) -> u64 {
++        self.0.load(Ordering::Relaxed) / 1000
++    }
++
++    pub(crate) fn time(&self) -> Blocked<'_> {
++        Blocked(self, Instant::now())
++    }
++}
++
++pub(crate) struct Blocked<'a>(&'a WaitCounter, Instant);
++impl Drop for Blocked<'_> {
++    fn drop(&mut self) {
++        self.0
++            .0
++            .fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    }
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum Block {
++    Pacing,
++    Fence,
++    Value,
++    Releaser,
++}
++static BLOCKED: [WaitCounter; 4] = [const { WaitCounter::new() }; 4];
++
++pub(crate) fn title_block(kind: Block) -> Option<Blocked<'static>> {
++    (WORKER.get().is_none() && !HELPER.get()).then(|| BLOCKED[kind as usize].time())
++}
++
++pub(crate) static RELAY_WAIT: WaitCounter = WaitCounter::new();
++
++pub(crate) fn submit_relay_block() -> Option<Blocked<'static>> {
++    WORKER
++        .get()
++        .is_some_and(|worker| std::ptr::eq(worker, &SUBMIT))
++        .then(|| RELAY_WAIT.time())
++}
++
++pub(crate) fn monitor_blocked(kind: Block) -> u64 {
++    BLOCKED[kind as usize].micros()
++}
++
++#[cfg(test)]
++#[test]
++fn blocked_counters_are_zero_until_a_wait_and_accumulate_without_reset() {
++    let counter = WaitCounter::new();
++    assert_eq!(counter.micros(), 0);
++    let before = monitor_blocked(Block::Releaser);
++    let mutex = Mutex::new(());
++    drop(lock_title(&mutex, Block::Releaser));
++    assert_eq!(monitor_blocked(Block::Releaser), before);
++    std::thread::scope(|scope| {
++        let held = mutex.lock().unwrap();
++        let (send, recv) = std::sync::mpsc::channel();
++        let mutex = &mutex;
++        let waiter = scope.spawn(move || {
++            send.send(()).unwrap();
++            drop(lock_title(mutex, Block::Releaser));
++        });
++        recv.recv().unwrap();
++        std::thread::sleep(Duration::from_millis(5));
++        drop(held);
++        waiter.join().unwrap();
++    });
++    assert!(monitor_blocked(Block::Releaser) > before);
++    {
++        let _wait = counter.time();
++        std::thread::sleep(Duration::from_millis(2));
++    }
++    let first = counter.micros();
++    assert!(first >= 2000);
++    assert_eq!(counter.micros(), first);
++    {
++        let _wait = counter.time();
++        std::thread::sleep(Duration::from_millis(2));
++    }
++    assert!(counter.micros() >= first + 2000);
++}
++
+ #[derive(Clone, Copy)]
+ pub(crate) enum Call {
+     Present,
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 2493c5a..b0e2267 100644
+index cd99983..b0e2267 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
 @@ -2173,6 +2173,7 @@ struct CardRange {
@@ -57,7 +189,42 @@ index 2493c5a..b0e2267 100644
      line: Vec::new(),
      written: Vec::new(),
      lists: 0,
-@@ -5878,6 +5884,7 @@ impl Host {
+@@ -3698,7 +3704,12 @@ pub(crate) fn settle_now(why: usize) {
+     let Some(host) = host() else {
+         return;
+     };
+-    let mut submitted = frame_wait::lock(&host.submitted);
++    let kind = if why == WHY_FENCE {
++        frame_wait::Block::Fence
++    } else {
++        frame_wait::Block::Value
++    };
++    let mut submitted = frame_wait::lock_title(&host.submitted, kind);
+     host.settle(&mut submitted, why);
+ }
+ 
+@@ -3818,11 +3829,20 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+     let was_working = working(false);
+     let waiting = std::time::Instant::now();
++    let kind = if why == WHY_FENCE {
++        frame_wait::Block::Fence
++    } else {
++        frame_wait::Block::Value
++    };
++    let blocked = frame_wait::title_block(kind);
++    let relay_blocked = frame_wait::submit_relay_block();
+     while !done(&line) {
+         line = frame_wait::during(Stage::Landing, || {
+             LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner())
+         });
+     }
++    drop(relay_blocked);
++    drop(blocked);
+     drop(line);
+     stood(waiting);
+     working(was_working);
+@@ -5864,6 +5884,7 @@ impl Host {
          RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
          {
              let mut line = line();
@@ -65,7 +232,7 @@ index 2493c5a..b0e2267 100644
              let Line {
                  line: items,
                  written,
-@@ -6143,6 +6150,7 @@ impl Host {
+@@ -6129,6 +6150,7 @@ impl Host {
          let told = !sent.writes.is_empty();
          let most = {
              let mut line = line();
@@ -73,7 +240,7 @@ index 2493c5a..b0e2267 100644
              let Line {
                  line: items,
                  written,
-@@ -6210,6 +6218,7 @@ impl Host {
+@@ -6196,6 +6218,7 @@ impl Host {
          let number = sent.number;
          {
              let mut line = line();
@@ -81,7 +248,7 @@ index 2493c5a..b0e2267 100644
              let Line {
                  line: items,
                  written,
-@@ -6250,6 +6259,38 @@ impl Host {
+@@ -6236,6 +6259,38 @@ impl Host {
          number
      }
  
@@ -120,7 +287,7 @@ index 2493c5a..b0e2267 100644
      /// Waits for the card to run every flight in the air ([`late`]) and
      /// does what they left to do, as [`Host::execute`] does for one
      /// submission after its wait: the pieces their shaders wrote in copies
-@@ -6627,8 +6668,17 @@ impl Host {
+@@ -6613,8 +6668,17 @@ impl Host {
          // Flights in the air ([`late`]): a submission that is waited for
          // settles them first, one sent ahead only if preparing it reads
          // what they write.
@@ -138,7 +305,7 @@ index 2493c5a..b0e2267 100644
          } else if let Some(why) = late_blocked(runs, &gpu_fills) {
              if relay_exact() && why == WHY_READ {
                  // Only until the flights that may write what is read have
-@@ -6727,7 +6777,11 @@ impl Host {
+@@ -6713,7 +6777,11 @@ impl Host {
              // All reads of title bytes, the second write-watch query and
              // all sends to the card stay on the far side of the same wait.
              let settling = std::time::Instant::now();
@@ -151,7 +318,7 @@ index 2493c5a..b0e2267 100644
              settled += settling.elapsed();
          };
          // One write-watch asking for everything the submission refreshes
-@@ -6854,7 +6908,10 @@ impl Host {
+@@ -6840,7 +6908,10 @@ impl Host {
              submitting(0, 0);
              #[cfg(feature = "diagnostics")]
              crate::copystat::submission_ends(lock);
@@ -162,7 +329,7 @@ index 2493c5a..b0e2267 100644
                  number: this_submission,
                  card,
                  back,
-@@ -7963,6 +8020,12 @@ impl HostList {
+@@ -7949,6 +8020,12 @@ impl HostList {
          }
      }
  
@@ -756,11 +923,95 @@ index 2bd0e74..5044d60 100644
      let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
      if guard.is_none() {
          *guard = Memory::new();
+diff --git a/crates/victory-gpu/src/monitor.rs b/crates/victory-gpu/src/monitor.rs
+index dd6656a..8aaae78 100644
+--- a/crates/victory-gpu/src/monitor.rs
++++ b/crates/victory-gpu/src/monitor.rs
+@@ -43,7 +43,7 @@ pub(crate) fn title_return(start: Instant, ns: u64) {
+     PRESENT_NS.fetch_add(ns, Relaxed);
+ }
+ 
+-pub(crate) static PIPELINE_WAIT_US: AtomicU64 = AtomicU64::new(0);
++pub(crate) static PIPELINE_WAIT: frame_wait::WaitCounter = frame_wait::WaitCounter::new();
+ static PAGES: AtomicU64 = AtomicU64::new(0);
+ 
+ /// A placed buffer may begin partway through a 64 KiB page. Each placement
+@@ -157,6 +157,10 @@ fields!(
+     drop_pipeline,
+     drop_indirect,
+     pipeline_wait_us,
++    title_pacing_us,
++    title_fence_us,
++    title_value_us,
++    title_releaser_us,
+     texture_upload_bytes,
+     to_card_bytes,
+     from_card_bytes,
+@@ -294,7 +298,16 @@ impl Recorder {
+         put(drop_indirect, indirect);
+         put(drop_pipeline, draw::DROPPED.load(Relaxed));
+         put(pipelines_making, pipeline::making());
+-        put(pipeline_wait_us, PIPELINE_WAIT_US.load(Relaxed));
++        put(pipeline_wait_us, PIPELINE_WAIT.micros());
++        put(relay_wait_us, frame_wait::RELAY_WAIT.micros());
++        for (field, kind) in [
++            (title_pacing_us, frame_wait::Block::Pacing),
++            (title_fence_us, frame_wait::Block::Fence),
++            (title_value_us, frame_wait::Block::Value),
++            (title_releaser_us, frame_wait::Block::Releaser),
++        ] {
++            put(field, frame_wait::monitor_blocked(kind));
++        }
+         put(textures_waiting, draw::HEAP_TEXTURES_QUEUE[2].load(Relaxed));
+         put(texture_upload_bytes, draw::HEAP_TEXTURE_BYTES.load(Relaxed));
+         put(to_card_bytes, shadow::CARD_STATS[0].load(Relaxed));
+@@ -359,6 +372,22 @@ fn delta(value: u64, prior: u64, continuous: bool) -> u64 {
+ mod tests {
+     use super::*;
+     #[test]
++    fn blocker_fields_fit_the_ring_and_have_numeric_zero_deltas() {
++        assert!(NAMES.len() + EXTRA.len() <= FIELDS);
++        for name in [
++            "title_pacing_us",
++            "title_fence_us",
++            "title_value_us",
++            "title_releaser_us",
++            "pipeline_wait_us",
++            "relay_wait_us",
++        ] {
++            assert!(NAMES.contains(&name));
++        }
++        let counter = frame_wait::WaitCounter::new();
++        assert_eq!(delta(counter.micros(), 0, true), 0);
++    }
++    #[test]
+     fn placement_pages_balance_across_unaligned_ends() {
+         let base = PAGES.load(Relaxed);
+         placed_pages(65535, 2, true);
 diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
-index 883addb..ac30fa4 100644
+index 79fa0d9..ac30fa4 100644
 --- a/crates/victory-gpu/src/pipeline/make.rs
 +++ b/crates/victory-gpu/src/pipeline/make.rs
-@@ -561,6 +561,20 @@ fn drained() {
+@@ -384,6 +384,7 @@ fn wait(p: &Pending, frame: u64) {
+         if rest.is_zero() {
+             break;
+         }
++        let _blocked = crate::monitor::PIPELINE_WAIT.time();
+         held = done
+             .wait_timeout(held, rest)
+             .unwrap_or_else(|e| e.into_inner())
+@@ -402,10 +403,6 @@ fn wait(p: &Pending, frame: u64) {
+             }
+         }
+     }
+-    if crate::monitor::enabled() {
+-        crate::monitor::PIPELINE_WAIT_US
+-            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+-    }
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(
+         crate::copystat::C::PipelineWaitUs,
+@@ -564,6 +561,20 @@ fn drained() {
  mod tests {
      use super::*;
  
@@ -781,6 +1032,27 @@ index 883addb..ac30fa4 100644
      /// A first use queues the pipeline and, within the budget, gets the
      /// worker's answer (here: no host pipeline for no shaders).
      #[test]
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 17a59f2..a36672e 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -490,7 +490,7 @@ fn release_held_now(all: bool) -> bool {
+     }
+     let _one = {
+         let _waiting = frame_wait::present_releaser();
+-        lock(&RELEASING)
++        frame_wait::lock_title(&RELEASING, frame_wait::Block::Releaser)
+     };
+     let was_here = RELEASING_HERE.replace(true);
+     struct Leave(bool);
+@@ -1113,6 +1113,7 @@ impl FrameLimit {
+             |&(owner, count): &(usize, usize)| count == 0 || (owner == queue && count < limit);
+         if !available(&active) {
+             let _pacing = frame_wait::time(Call::Pacing);
++            let _blocked = frame_wait::title_block(frame_wait::Block::Pacing);
+             active = self
+                 .changed
+                 .wait_while(active, |state| !available(state))
 diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
 index 4d3f632..8be9034 100644
 --- a/crates/victory-gpu/src/shadow.rs
