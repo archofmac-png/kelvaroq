@@ -9,9 +9,16 @@ Broader diagnostics depth-bounds/stack-walker issues from 0065 remain unresolved
 Current response and checks: [Lane A round 2](docs/uma-0066.md).
 External-data measurement protocol remains in [0065](docs/uma-0065.md).
 Removal preservation is opt-in; live title resume remains unsupported.
-Removal checks and limits: [0067](docs/removal-0067.md).
+Removal checks and limits: [0068](docs/removal-0068.md); suspended forensic capture only.
 
 ## Sessions
+
+### 2026-11-26 (4) — Bounded suspended forensic capture and real removal dispatch
+<!-- session: lane-a-0068-20261126-91bf -->
+- DONE: 65 launcher, 282 GPU, 113 HLE, 41 loader and 8 diagnostics checks passed; series matched. See [0068](docs/removal-0068.md).
+- DECIDED: Separate helper, PARTIAL-first streaming hashes, 2-second budget; breadcrumbs require subflag. Real dispatch capped at three.
+- UNVERIFIED: Title-scale completion, frame costs, unsaved progress. Existing broader-suite issues remain.
+- NEXT: Measure title inventory/watchdog interval and mode costs before enablement.
 
 ### 2026-11-26 (3) — Added default-off removal preservation and safe exit
 <!-- session: lane-a-0067-20261126-7e43 -->

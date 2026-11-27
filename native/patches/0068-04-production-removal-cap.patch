@@ -1,0 +1,451 @@
+diff --git a/README.md b/README.md
+index ff266da..81d057f 100644
+--- a/README.md
++++ b/README.md
+@@ -278,6 +278,15 @@ saves and storage are not an atomic checkpoint; unsaved progress is not guarante
+ This build makes zero automatic title restart/replay attempts. Device children
+ remain cached and lost GPU writes have no replayable safe point. Successful
+ forensic capture exits `0xE0670001`; incomplete capture exits `0xE0670002`.
++Repeated owner-thread removal callbacks cross one production lifetime gate:
++maximum three admissions; the fourth exits `0xE0680003` before callback code.
++Simultaneous submit/present/fence observers coalesce without consuming that cap.
++The JSON report distinguishes `removal_dispatches` / `removal_dispatch_cap`
++from `attempts: 0` (no title restart). The test-only WARP reconstruction probe
++has a separate guard: trying to enter live callbacks exits `0xE0680004` without
++invoking one or consuming its budget. Real WARP device removal tests exercise
++the host notification/failure route, recurrence cap and forbidden probe route.
++
+ One JSON event records artifacts, outcome and actual folder when reporting
+ finishes within budget; a hard deadline can leave only `PARTIAL`. Keep all
+ generations and never copy partial files over live saves. With the flag off,
+diff --git a/crates/victory-gpu/src/removal.rs b/crates/victory-gpu/src/removal.rs
+index 1c676bd..5267927 100644
+--- a/crates/victory-gpu/src/removal.rs
++++ b/crates/victory-gpu/src/removal.rs
+@@ -21,7 +21,95 @@ pub struct Removal {
+     pub fault: String,
+ }
+ 
++/// Recurring removal callbacks exhausted the process-lifetime admission budget.
++pub const RECURRING_REMOVAL_EXIT: u32 = 0xe0680003;
++/// A destructive diagnostics probe tried to enter the live removal callback.
++#[cfg(all(windows, test, feature = "diagnostics"))]
++pub(crate) const PROBE_REENTRY_EXIT: u32 = 0xe0680004;
++
+ static REPORT: OnceLock<fn(&Removal) -> !> = OnceLock::new();
++static DISPATCHES: AttemptBudget = AttemptBudget(AtomicU32::new(0));
++static OWNER: AtomicU32 = AtomicU32::new(0);
++
++fn observer_id() -> u32 {
++    #[cfg(windows)]
++    // SAFETY: a plain query; Windows thread ids are nonzero and unique among
++    // live threads. The owner callback diverges and never relinquishes its id.
++    unsafe {
++        windows::Win32::System::Threading::GetCurrentThreadId()
++    }
++    #[cfg(not(windows))]
++    {
++        static NEXT: AtomicU32 = AtomicU32::new(1);
++        thread_local! {
++            static ID: u32 = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
++                |id| id.checked_add(1)).unwrap_or_else(|_| terminal(RECURRING_REMOVAL_EXIT));
++        }
++        ID.with(|id| *id)
++    }
++}
++
++fn coalesce_observers() {
++    let me = observer_id();
++    if OWNER
++        .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
++        .is_err_and(|owner| owner != me)
++    {
++        // Simultaneous submit/present/fence observers describe the same
++        // failure. They cannot consume attempts or terminate the owner while
++        // its helper is capturing RAM. Only recurrence on the owner thread
++        // reaches the budget. The terminal callback never resets ownership.
++        loop {
++            #[cfg(windows)]
++            // SAFETY: park this observer without allocating or taking locks.
++            unsafe {
++                windows::Win32::System::Threading::Sleep(u32::MAX);
++            }
++            #[cfg(not(windows))]
++            std::thread::park();
++        }
++    }
++}
++
++/// Number of admitted production removal callbacks, never reset after dispatch.
++/// These are callback admissions, not proof of a resumed title or GPU replay.
++pub fn dispatch_count() -> u32 {
++    DISPATCHES.0.load(Ordering::Acquire)
++}
++
++#[cfg(all(windows, test, feature = "diagnostics"))]
++static PROBING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// The reconstruction fixture may remove its own device, but cannot re-enter
++/// live removal handling from any thread or consume that path's lifetime cap.
++#[cfg(all(windows, test, feature = "diagnostics"))]
++pub(crate) struct ProbeGuard;
++#[cfg(all(windows, test, feature = "diagnostics"))]
++impl ProbeGuard {
++    pub(crate) fn enter() -> Self {
++        if PROBING.swap(true, Ordering::AcqRel) {
++            terminal(PROBE_REENTRY_EXIT);
++        }
++        Self
++    }
++}
++#[cfg(all(windows, test, feature = "diagnostics"))]
++impl Drop for ProbeGuard {
++    fn drop(&mut self) {
++        PROBING.store(false, Ordering::Release);
++    }
++}
++
++fn terminal(code: u32) -> ! {
++    #[cfg(windows)]
++    // SAFETY: recurring failure is terminal. Do not acquire locks or run title
++    // detach callbacks while another observer may already be preserving RAM.
++    unsafe {
++        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
++        let _ = TerminateProcess(GetCurrentProcess(), code);
++    }
++    std::process::exit(code as i32)
++}
+ pub fn on_removal(report: fn(&Removal) -> !) {
+     let _ = REPORT.set(report);
+ }
+@@ -30,6 +118,17 @@ pub(crate) fn report(event: &Removal) {
+     if enabled()
+         && let Some(report) = REPORT.get()
+     {
++        #[cfg(all(windows, test, feature = "diagnostics"))]
++        if PROBING.load(Ordering::Acquire) {
++            terminal(PROBE_REENTRY_EXIT);
++        }
++        coalesce_observers();
++        // Recursive owner faults cannot obtain a fourth admission. Normal
++        // title handling terminates on its first admission; this does not
++        // introduce unsafe title reconstruction or replay.
++        if DISPATCHES.take().is_none() {
++            terminal(RECURRING_REMOVAL_EXIT);
++        }
+         report(event);
+     }
+ }
+diff --git a/crates/victory-gpu/src/removal_warp_tests.rs b/crates/victory-gpu/src/removal_warp_tests.rs
+index bd2b701..42bfaf4 100644
+--- a/crates/victory-gpu/src/removal_warp_tests.rs
++++ b/crates/victory-gpu/src/removal_warp_tests.rs
+@@ -136,7 +136,182 @@ fn warp_removal_routes_through_host_failure_with_the_flag_on_and_off() {
+     }
+ }
+ 
++/// Exercise recurrence through host::fail after an actual device removal, not
++/// just a local budget or report mock. A fourth dispatch cannot run the callback.
++#[test]
++fn real_removal_dispatch_stops_at_three_and_probe_cannot_reenter() {
++    const CHILD: &str = "VICTORY_0068_REMOVAL_CAP_CHILD";
++    const TEST: &str =
++        "removal_warp_tests::real_removal_dispatch_stops_at_three_and_probe_cannot_reenter";
++    if let Some(root) = std::env::var_os(CHILD) {
++        fn recurring(event: &crate::removal::Removal) -> ! {
++            use std::io::Write;
++            assert!(event.reason < 0);
++            let root = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
++            let mut record = std::fs::OpenOptions::new()
++                .create(true)
++                .append(true)
++                .open(root.join("callbacks"))
++                .unwrap();
++            writeln!(record, "{}", crate::removal::dispatch_count()).unwrap();
++            record.sync_all().unwrap();
++            drop(record);
++            if std::env::var_os("VICTORY_0068_CONCURRENT_OBSERVERS").is_some() {
++                use std::sync::{
++                    Arc, Barrier,
++                    atomic::{AtomicU32, Ordering},
++                };
++                assert_eq!(
++                    crate::removal::dispatch_count(),
++                    1,
++                    "only the owner may enter callback"
++                );
++                let release = Arc::new(Barrier::new(9));
++                let entered = Arc::new(AtomicU32::new(0));
++                let (ready, arrivals) = std::sync::mpsc::channel();
++                for _ in 0..8 {
++                    let release = release.clone();
++                    let entered = entered.clone();
++                    let ready = ready.clone();
++                    drop(std::thread::spawn(move || {
++                        ready.send(()).unwrap();
++                        release.wait();
++                        entered.fetch_add(1, Ordering::Release);
++                        crate::host::fail(format_args!("0068 concurrent host removal observer"));
++                    }));
++                }
++                for _ in 0..8 {
++                    arrivals
++                        .recv_timeout(Duration::from_secs(5))
++                        .expect("observer ready");
++                }
++                release.wait();
++                let started = Instant::now();
++                while entered.load(Ordering::Acquire) != 8 {
++                    assert!(
++                        started.elapsed() < Duration::from_secs(5),
++                        "observers did not enter fail"
++                    );
++                    std::thread::sleep(Duration::from_millis(1));
++                }
++                // Give every observer a bounded opportunity to reach the
++                // production dispatch gate. They must park without consuming
++                // admissions or killing the owner's preservation callback.
++                std::thread::sleep(Duration::from_millis(250));
++                assert_eq!(crate::removal::dispatch_count(), 1);
++                assert_eq!(
++                    std::fs::read_to_string(root.join("callbacks")).unwrap(),
++                    "1\n"
++                );
++                std::process::exit(68);
++            }
++            // Re-enter the real host failure route: GetDeviceRemovedReason
++            // still observes the removed device, and every entry must cross
++            // the same production dispatch budget.
++            crate::host::fail(format_args!("0068 recurring host removal"));
++        }
++        crate::removal::on_removal(recurring);
++        let _root = root;
++        if std::env::var_os("VICTORY_0068_PROBE_REENTRY").is_some() {
++            let _probe = crate::removal::ProbeGuard::enter();
++            // A genuine removal in a destructive fixture must not re-enter
++            // the title callback, even while production recovery is enabled.
++            crate::removal::report(&removed_event());
++        } else {
++            let host = crate::host::host().expect("isolated host WARP device");
++            let removable = host
++                .device
++                .cast::<ID3D12Device5>()
++                .expect("RemoveDevice interface");
++            // SAFETY: this child is restricted to the diagnostics WARP adapter.
++            unsafe { removable.RemoveDevice() };
++            std::thread::sleep(Duration::from_secs(10));
++        }
++        panic!("terminal removal dispatch returned");
++    }
++    for (probing, concurrent) in [(false, false), (true, false), (false, true)] {
++        let root = tempfile::tempdir().unwrap();
++        let mut command = Command::new(std::env::current_exe().unwrap());
++        command
++            .args(["--exact", TEST, "--nocapture"])
++            .env(CHILD, root.path())
++            .env("VICTORY_RECOVER_REMOVAL", "1")
++            .env("VICTORY_D3D12_WARP", "1");
++        if probing {
++            command.env("VICTORY_0068_PROBE_REENTRY", "1");
++        } else {
++            command.env_remove("VICTORY_0068_PROBE_REENTRY");
++        }
++        if concurrent {
++            command.env("VICTORY_0068_CONCURRENT_OBSERVERS", "1");
++        } else {
++            command.env_remove("VICTORY_0068_CONCURRENT_OBSERVERS");
++        }
++        let mut child = ChildGuard(command.spawn().unwrap());
++        let started = Instant::now();
++        let status = loop {
++            if let Some(status) = child.0.try_wait().unwrap() {
++                break status;
++            }
++            assert!(
++                started.elapsed() < Duration::from_secs(30),
++                "production cap child timed out"
++            );
++            std::thread::sleep(Duration::from_millis(10));
++        };
++        assert_eq!(
++            status.code().unwrap() as u32,
++            if probing {
++                crate::removal::PROBE_REENTRY_EXIT
++            } else if concurrent {
++                68
++            } else {
++                crate::removal::RECURRING_REMOVAL_EXIT
++            }
++        );
++        if probing {
++            assert!(
++                !root.path().join("callbacks").exists(),
++                "probe must invoke zero title callbacks"
++            );
++        } else {
++            assert_eq!(
++                std::fs::read_to_string(root.path().join("callbacks")).unwrap(),
++                if concurrent { "1\n" } else { "1\n2\n3\n" }
++            );
++        }
++    }
++}
++
++/// Produce a genuine removal event for the forbidden probe reentry test.
++/// All COM references are released before the owned report is returned.
++fn removed_event() -> crate::removal::Removal {
++    let adapter = crate::host::warp_adapter().expect("WARP is required");
++    let device = make_device(&adapter);
++    submit(&device);
++    let removable = device
++        .cast::<ID3D12Device5>()
++        .expect("RemoveDevice interface");
++    // SAFETY: this helper only creates a software device in a disposable child.
++    unsafe { removable.RemoveDevice() };
++    let reason = unsafe { device.GetDeviceRemovedReason() }
++        .expect_err("actual WARP device removal")
++        .code()
++        .0;
++    assert!(crate::removal::is_removal(
++        DXGI_ERROR_DEVICE_REMOVED.0,
++        reason
++    ));
++    crate::removal::Removal {
++        reason,
++        in_flight_commands: None,
++        dred: String::new(),
++        fault: "0068 real recurring WARP removal".into(),
++    }
++}
++
+ fn probe() {
++    let _probe = crate::removal::ProbeGuard::enter();
+     let adapter = crate::host::warp_adapter().expect("WARP is required for this diagnostics test");
+     let budget = crate::removal::AttemptBudget::default();
+     let mut device = make_device(&adapter);
+diff --git a/crates/victory-hle/src/modules/d3d12x/recovery.rs b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+index 4f0d003..f26eac4 100644
+--- a/crates/victory-hle/src/modules/d3d12x/recovery.rs
++++ b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+@@ -1,24 +1,33 @@
+ //! Fail closed until the runtime has a replayable CPU/GPU checkpoint and
+ //! replaceable device generations. Never reinterpret a RAM dump as one.
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicU32, Ordering};
+ use victory_gpu::removal::Removal;
+ use victory_loader::recovery::{
+     json_string,
+     worker::{Request, launch},
+ };
+ 
++#[cfg(test)]
+ const UNSAFE_RESUME: u32 = 0xe0670001;
+ const PRESERVE_FAILED: u32 = 0xe0670002;
+ 
+ fn enter_failure() {
+     // No other GPU fault may terminate the process while the first observer
+     // is preserving it. All enabled failure routes share this gate.
+-    static HANDLING: AtomicBool = AtomicBool::new(false);
+-    if HANDLING.swap(true, Ordering::AcqRel) {
++    static HANDLING: AtomicU32 = AtomicU32::new(0);
++    let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
++    if HANDLING
++        .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
++        .is_err_and(|owner| owner != me)
++    {
+         loop {
+-            std::thread::park();
++            unsafe {
++                windows_sys::Win32::System::Threading::Sleep(u32::MAX);
++            }
+         }
+     }
++    // Same-owner recurrence must return through the GPU's lifetime cap rather
++    // than deadlocking here before its distinct terminal exit.
+ }
+ 
+ pub(super) fn removed(event: &Removal) -> ! {
+@@ -37,6 +46,7 @@ pub(super) fn removed(event: &Removal) -> ! {
+         log: victory_loader::crash_log_path()
+             .unwrap_or(std::path::Path::new("crashes.log"))
+             .to_owned(),
++        dispatches: victory_gpu::removal::dispatch_count(),
+         reason: event.reason,
+         commands: event.in_flight_commands,
+         dred: event.dred.clone(),
+@@ -92,6 +102,9 @@ mod tests {
+             });
+             victory_loader::log_crashes_to(root.join("crashes.log"));
+             if victory_gpu::removal::enabled() {
++                // Same-owner reentry must not park ahead of the GPU cap.
++                enter_failure();
++                enter_failure();
+                 if std::env::var_os("VICTORY_0067_BUSY_SAVE").is_some() {
+                     super::super::super::xgamesave::recovery_test_busy(|| removed(&event()));
+                 }
+@@ -151,6 +164,8 @@ mod tests {
+                     assert!(log.contains(&format!("\"{field}\":")), "missing {field}");
+                 }
+                 assert!(log.contains("\"attempts\":0"));
++                assert!(log.contains("\"removal_dispatch_cap\":3"));
++                assert!(log.contains("\"removal_dispatches\":0"));
+                 assert!(log.contains(if busy {
+                     "exit_snapshot_failed"
+                 } else {
+diff --git a/crates/victory-loader/src/recovery/worker.rs b/crates/victory-loader/src/recovery/worker.rs
+index d24d2db..02ada86 100644
+--- a/crates/victory-loader/src/recovery/worker.rs
++++ b/crates/victory-loader/src/recovery/worker.rs
+@@ -16,6 +16,7 @@ pub struct Request {
+     pub saves: PathBuf,
+     pub storage: PathBuf,
+     pub log: PathBuf,
++    pub dispatches: u32,
+     pub reason: i32,
+     pub commands: Option<u64>,
+     pub dred: String,
+@@ -35,7 +36,7 @@ pub fn launch(request: Request) -> io::Result<()> {
+     let deadline = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+         .saturating_add(millis);
+     // Independent fallback covers a blocked CreateProcess or helper startup.
+-    // Once suspended, the helper's own watchdog replaces this one.
++    // Keep this watchdog runnable after suspension; the helper also has one.
+     let (tx, rx) = std::sync::mpsc::sync_channel(0);
+     std::thread::Builder::new()
+         .name("recovery-start-deadline".into())
+@@ -73,6 +74,10 @@ pub fn launch(request: Request) -> io::Result<()> {
+         .env("SCARLETT_RECOVERY_STORAGE", request.storage)
+         .env("SCARLETT_RECOVERY_LOG", request.log)
+         .env("SCARLETT_RECOVERY_DEADLINE", deadline.to_string())
++        .env(
++            "SCARLETT_RECOVERY_DISPATCHES",
++            request.dispatches.to_string(),
++        )
+         .env("SCARLETT_RECOVERY_REASON", request.reason.to_string())
+         .env(
+             "SCARLETT_RECOVERY_COMMANDS",
+@@ -283,6 +288,7 @@ pub fn worker() {
+         folder = folder.with_extension("");
+     }
+     let report = (|| -> io::Result<()> {
++        let dispatches = number::<u32>("SCARLETT_RECOVERY_DISPATCHES")?;
+         let reason = number::<i32>("SCARLETT_RECOVERY_REASON")?;
+         let timestamp = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+@@ -291,7 +297,7 @@ pub fn worker() {
+         let commands =
+             number::<u64>("SCARLETT_RECOVERY_COMMANDS").map_or("null".into(), |n| n.to_string());
+         let line = format!(
+-            "{{\"timestamp_unix_ms\":{timestamp},\"kind\":\"{}\",\"reason\":{reason},\"in_flight_commands\":{commands},\"preserved\":{},\"recovery_attempted\":false,\"attempts\":0,\"attempt_cap\":3,\"outcome\":{},\"folder\":{},\"error\":{},\"dred\":{},\"fault\":{}}}\n",
++            "{{\"timestamp_unix_ms\":{timestamp},\"kind\":\"{}\",\"reason\":{reason},\"in_flight_commands\":{commands},\"preserved\":{},\"recovery_attempted\":false,\"attempts\":0,\"removal_dispatch_cap\":3,\"removal_dispatches\":{dispatches},\"outcome\":{},\"folder\":{},\"error\":{},\"dred\":{},\"fault\":{}}}\n",
+             if reason as u32 == 0x887a0007 {
+                 "device_reset"
+             } else {
+@@ -538,6 +544,7 @@ mod tests {
+                 saves,
+                 storage,
+                 log: root.join("crashes.log"),
++                dispatches: 0,
+                 reason: 0x887a0005u32 as i32,
+                 commands: None,
+                 dred: String::new(),
