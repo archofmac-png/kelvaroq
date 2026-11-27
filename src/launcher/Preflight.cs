@@ -94,7 +94,10 @@ internal sealed class PreflightOutcome {
 internal static class Preflight {
     const string SkipVariable = "VICTORY_SKIP_PREFLIGHT";
     // RUNBOOK section 0: "32 GB RAM, 80 GB commit limit".
-    const long CommitFloor = 80L << 30, RamRecommended = 32L << 30;
+    // A world run commits about 33 GiB; 48 GiB is the floor that keeps error 1455 away with margin.
+    // 80 GiB is where the reference machine sat, so fall short of that as a warning, not a block:
+    // a 63 GiB machine at 79 GiB commit has more headroom than a 32 GiB machine at 80.
+    const long CommitFloor = 48L << 30, CommitComfortable = 80L << 30, RamRecommended = 32L << 30;
     // RUNBOOK section 0: "16 GB+ VRAM recommended | 12 GB is the floor; 8 GB drops head and skin meshes".
     const long VramFloorGiB = 12, VramRecommendedGiB = 16;
     // Task spec (not in a doc): driver older than 6 months.
@@ -132,9 +135,11 @@ internal static class Preflight {
         list.Add(Guarded("commit","Commit limit",false,() => {
             if (!f.CommitLimit.HasValue) return Make("commit","Commit limit",false,PreflightLevel.Warn,"commit limit could not be read.");
             long limit = f.CommitLimit.Value;
-            if (limit >= CommitFloor) return Make("commit","Commit limit",false,PreflightLevel.Pass,G(limit) + " (need " + G(CommitFloor) + ")");
+            if (limit >= CommitComfortable) return Make("commit","Commit limit",false,PreflightLevel.Pass,G(limit) + " (need " + G(CommitFloor) + ")");
             long ram = f.Hardware != null && f.Hardware.ram.HasValue ? f.Hardware.ram.Value : 0;
             string paging = ram > 0 ? "RAM " + G(ram) + " + paging file about " + G(Math.Max(0,limit - ram)) : "RAM + paging file";
+            if (limit >= CommitFloor) return Make("commit","Commit limit",false,PreflightLevel.Warn,"commit limit " + G(limit) + " is under the reference " + G(CommitComfortable) + " (" + paging +
+                "); it should run, but raise the paging file if a world load dies with Windows error 1455.");
             return Make("commit","Commit limit",false,PreflightLevel.Block,"commit limit " + G(limit) + " is under " + G(CommitFloor) + " (" + paging +
                 "); the run dies with Windows error 1455. Fix: raise the paging file by at least " + G(CommitFloor - limit) + " (Advanced system settings > Performance > Virtual memory), then retry.");
         }));

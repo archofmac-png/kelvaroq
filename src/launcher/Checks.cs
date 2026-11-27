@@ -99,10 +99,11 @@ internal static class Checks {
         Check(clean.All(r => r.Level == PreflightLevel.Pass) && !Preflight.Blocked(clean));
         Check(blocking.All(id => !clean.Single(r => r.Id == id).Advisory) && advisory.All(id => clean.Single(r => r.Id == id).Advisory));
 
-        // commit limit: 80 GiB is the line (docs/RUNBOOK.md section 0)
-        Verdict(root,"commit",PreflightLevel.Pass,f => f.CommitLimit = 80L << 30);
-        Verdict(root,"commit",PreflightLevel.Block,f => f.CommitLimit = (80L << 30) - 1);
-        Check(Result(new Func<PreflightFacts>(() => { var f = Healthy(root); f.CommitLimit = 60L << 30; return f; })(),"commit").Message.Contains("paging file"));
+        // commit limit: 48 GiB blocks, 80 GiB is the comfort line (docs/RUNBOOK.md section 0)
+        Verdict(root,"commit",PreflightLevel.Pass,f => f.CommitLimit = 96L << 30);
+        Verdict(root,"commit",PreflightLevel.Warn,f => f.CommitLimit = (48L << 30) + 1);
+        Verdict(root,"commit",PreflightLevel.Block,f => f.CommitLimit = (48L << 30) - 1);
+        Check(Result(new Func<PreflightFacts>(() => { var f = Healthy(root); f.CommitLimit = 20L << 30; return f; })(),"commit").Message.Contains("paging file"));
         Verdict(root,"commit",PreflightLevel.Warn,f => f.CommitLimit = null);
         // VRAM: block under 12, warn 12..16, pass at 16
         Verdict(root,"vram",PreflightLevel.Block,f => f.Hardware.Preferred.vram = 8L << 30);
@@ -447,6 +448,7 @@ internal static class Checks {
     }
 }
 }
+
 
 
 
