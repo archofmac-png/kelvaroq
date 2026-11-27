@@ -177,26 +177,40 @@ internal static class Archives {
         // If the new directory is already live, the recovery snapshot also holds the old one.
         Files.RemoveTree(previous); Files.RemoveTree(stage); File.Delete(marker);
     }
-    internal static void Restore(string file,Preferences prefs,string history,string build) {
-        Replace(prefs,history,build,stage => Inspect(file,stage));
+    /// reach is a fault-injection point called as each step begins ("snapshot", "verify-archive",
+    /// "publish", "swap"); production callers pass null.
+    internal static void Restore(string file,Preferences prefs,string history,string build,Action<string> reach = null) {
+        Replace(prefs,history,build,stage => Inspect(file,stage),reach);
     }
     internal static void ClearData(Preferences prefs,string history,string build) {
-        Replace(prefs,history,build,stage => {});
+        Replace(prefs,history,build,stage => {},null);
     }
     /// Approach after XCL 2d94699: publish verified contents only after the replacement is complete.
     /// A sibling stage permits a same-volume rename even when the archive is on another drive.
-    static void Replace(Preferences prefs,string history,string build,Action<string> prepare) {
+    /// The current state is snapshotted first, before the archive is even opened, so a restore that
+    /// fails at any later step still leaves the state it would have replaced. A failure names its step.
+    static void Replace(Preferences prefs,string history,string build,Action<string> prepare,Action<string> reach) {
+        string step = "snapshot";
+        Action<string> at = delegate(string name) { step = name; if (reach != null) reach(name); };
+        try { Publish(prefs,history,build,prepare,at); }
+        catch (StepFailure) { throw; }
+        catch (Exception ex) { throw new StepFailure(step,ex); }
+    }
+    static void Publish(Preferences prefs,string history,string build,Action<string> prepare,Action<string> at) {
         string dest = prefs.ActiveData, parent = Path.GetDirectoryName(dest);
+        at("snapshot");
         Files.SafeRoot(dest); Files.Separate(dest,history);
         Recover(dest,history);
+        Write(dest,history,build,"beforeRestore",null);
         Directory.CreateDirectory(parent);
         var pending = new Replacement { destination = Files.Full(dest), token = Guid.NewGuid().ToString("N") };
         string prefix = Path.Combine(parent,".kelvaroq-" + pending.token);
         string stage = prefix + ".incoming", previous = prefix + ".previous";
         Directory.CreateDirectory(stage);
         try {
+            at("verify-archive");
             prepare(stage);
-            Write(dest,history,build,"beforeRestore",null);
+            at("publish");
             string marker = Path.Combine(history,"replacement.json"), temp = Files.Unique(history);
             try {
                 using (var stream = new FileStream(temp,FileMode.CreateNew)) {
@@ -207,6 +221,7 @@ internal static class Archives {
             } finally { File.Delete(temp); }
             try {
                 if (Directory.Exists(dest)) Directory.Move(dest,previous);
+                at("swap");
                 Directory.Move(stage,dest);
             } finally { Recover(dest,history); }
         } finally { Files.RemoveTree(stage); }

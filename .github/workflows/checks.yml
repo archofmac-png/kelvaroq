@@ -40,6 +40,8 @@ jobs:
           cargo +stable test --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo +stable build --release --locked
+      - name: Test parser corpus without game data
+        run: python scripts/test_parsers.py
       - name: Vérifier le moteur de référence
         run: |
           python -m ruff check research scripts
@@ -57,3 +59,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./bench/render-verify.ps1 -Mode SelfTest
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Auto-tests du lanceur
+        shell: pwsh
+        run: |
+          # Launcher suites: preflight gate, log rotation, and every step of a data move and restore.
+          cargo build --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($s in 'preflight','logs','moveSteps','restoreFails','move','clear','archive','session','recovery') {
+            ./target/debug/kelvaroq-desktop.exe --self-test $s
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+

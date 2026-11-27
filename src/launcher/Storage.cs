@@ -9,8 +9,15 @@ using System.Xml;
 using System.Xml.Linq;
 
 namespace Kelvaroq {
-internal sealed class Problem : Exception {
+internal class Problem : Exception {
     internal Problem(string key) : base(key) {}
+    internal Problem(string key, Exception inner) : base(key,inner) {}
+}
+/// A multi-step operation failed. Names the step so the operator is never left guessing.
+/// Message is the localisation key of the underlying problem ("failed" for an unexpected one).
+internal sealed class StepFailure : Problem {
+    internal readonly string Step;
+    internal StepFailure(string step, Exception inner) : base(inner is Problem ? inner.Message : "failed",inner) { Step = step; }
 }
 internal static class Files {
     internal static readonly StringComparer Names = StringComparer.OrdinalIgnoreCase;
@@ -187,37 +194,82 @@ internal sealed class Preferences {
 }
 
 internal static class Relocation {
-    internal static void Move(string source, string dest, Action<int> progress, Action<bool> selectDestination) {
+    /// The steps of a move, in order. A failure in any of them leaves the source exactly as it was
+    /// and the destination absent. "cleanup" follows them: by then the destination is verified
+    /// and live, and only the retired copy of the source could not be removed.
+    internal static readonly string[] Steps = {"verify-destination","write-marker","copy","verify-checksums","flip","verify-source"};
+    static string Hex(byte[] hash) { return BitConverter.ToString(hash).Replace("-","").ToLowerInvariant(); }
+    // Flushed before anything is copied, so a crash leaves evidence of what was in flight and how far it got.
+    static void Mark(string marker, string source, string dest, string stage, string step) {
+        var note = new Dictionary<string,string>{{"source",source},{"destination",dest},{"stage",stage},{"step",step}};
+        using (var stream = new FileStream(marker,FileMode.Create,FileAccess.Write,FileShare.None)) {
+            byte[] bytes = Encoding.UTF8.GetBytes(Files.Json.Serialize(note));
+            stream.Write(bytes,0,bytes.Length); stream.Flush(true);
+        }
+    }
+    /// verify the destination, write a marker, copy, verify checksums, flip, verify the source, then retire it.
+    /// The source is never deleted before the destination is verified. A failure names its step (StepFailure).
+    /// reach is a fault-injection point called as each step begins; production callers pass null.
+    internal static void Move(string source, string dest, Action<int> progress, Action<bool> selectDestination, Action<string> reach = null) {
+        string step = Steps[0];
+        Action<string> at = delegate(string name) { step = name; if (reach != null) reach(name); };
+        try { Transfer(source,dest,progress,selectDestination,at); }
+        catch (StepFailure) { throw; }
+        catch (Exception ex) { throw new StepFailure(step,ex); }
+    }
+    static void Transfer(string source, string dest, Action<int> progress, Action<bool> selectDestination, Action<string> at) {
+        at("verify-destination");
         Files.SafeRoot(source); Files.SafeRoot(dest); Files.Separate(source,dest);
         if (File.Exists(dest) || Directory.Exists(dest)) throw new Problem("destinationExists");
-        string stage = Files.Unique(Path.GetDirectoryName(dest));
+        string stage = Files.Unique(Path.GetDirectoryName(dest)), marker = stage + ".move";
         string parked = Files.Unique(Path.GetDirectoryName(source));
-        Directory.CreateDirectory(stage);
         try {
+            at("write-marker");
+            Directory.CreateDirectory(Path.GetDirectoryName(dest));
+            Mark(marker,source,dest,stage,"copy");
+            Directory.CreateDirectory(stage);
+            at("copy");
             var paths = Files.Tree(source).ToList();
             long total = paths.Where(File.Exists).Sum(p => new FileInfo(p).Length), copied = 0;
             int reported = -1;
             var buffer = new byte[131072];
+            var hashes = new Dictionary<string,string>(Files.Names);
+            var folders = new HashSet<string>(Files.Names);
             foreach (string path in paths) {
-                var target = Path.Combine(stage,path.Substring(source.TrimEnd('\\').Length + 1));
-                if (Directory.Exists(path)) { Directory.CreateDirectory(target); continue; }
+                string relative = path.Substring(source.TrimEnd('\\').Length + 1), target = Path.Combine(stage,relative);
+                if (Directory.Exists(path)) { Directory.CreateDirectory(target); folders.Add(relative); continue; }
                 using (var input = File.OpenRead(path))
-                using (var output = new FileStream(target,FileMode.CreateNew)) {
+                using (var output = new FileStream(target,FileMode.CreateNew))
+                using (var sha = System.Security.Cryptography.SHA256.Create()) {
                     int n;
                     while ((n = input.Read(buffer,0,buffer.Length)) != 0) {
-                        output.Write(buffer,0,n); copied += n;
+                        output.Write(buffer,0,n); sha.TransformBlock(buffer,0,n,null,0); copied += n;
                         int percent = (int)(copied * 100 / Math.Max(total,1));
                         if (reported != percent) { progress(percent); reported = percent; }
                     }
-                    output.Flush(true); input.Position = output.Position = 0;
-                    if (Files.Hash(input) != Files.Hash(output)) throw new Problem("checksum");
+                    sha.TransformFinalBlock(buffer,0,0); output.Flush(true);
+                    hashes[relative] = Hex(sha.Hash);
                 }
             }
+            // What was written is read back and compared with what was read from the source.
+            at("verify-checksums");
+            int verified = 0;
+            foreach (string path in Files.Tree(stage)) {
+                string relative = path.Substring(stage.Length + 1), want;
+                if (Directory.Exists(path)) { if (!folders.Contains(relative)) throw new Problem("checksum"); continue; }
+                using (var written = File.OpenRead(path))
+                    if (!hashes.TryGetValue(relative,out want) || Files.Hash(written) != want) throw new Problem("checksum");
+                verified++;
+            }
+            if (verified != hashes.Count) throw new Problem("checksum");
+            at("flip");
+            Mark(marker,source,dest,stage,"flip");
             Directory.Move(stage,dest);
             try { selectDestination(true); } catch { Directory.Move(dest,stage); throw; }
             // A writer can add or replace a file during a cross-volume copy.
             // Retire the source by name, then compare the exact tree being removed.
             try {
+                at("verify-source");
                 if (Directory.Exists(source)) {
                     Directory.Move(source,parked);
                     var copiedNames = new HashSet<string>(Files.Tree(dest).Select(p => p.Substring(dest.Length)),Files.Names);
@@ -236,7 +288,8 @@ internal static class Relocation {
                 selectDestination(false);
                 Directory.Move(dest,stage); throw;
             }
-        } finally { Files.RemoveTree(stage); }
+        } finally { Files.RemoveTree(stage); if (File.Exists(marker)) File.Delete(marker); }
+        at("cleanup");
         try { Files.RemoveTree(parked); }
         catch (IOException) { throw new Problem("sourceCleanup"); }
         catch (UnauthorizedAccessException) { throw new Problem("sourceCleanup"); }

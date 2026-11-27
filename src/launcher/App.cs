@@ -24,7 +24,14 @@ internal sealed class Locale {
             Strings = Files.Json.Deserialize<Dictionary<string,string>>(r.ReadToEnd());
     }
     internal string T(string key, params object[] args) { return String.Format(Culture,Strings[key],args); }
-    internal string Error(Exception ex) { return ex is Problem ? T(ex.Message) : T("failed") + "\n" + ex.Message; }
+    internal string Error(Exception ex) {
+        var step = ex as StepFailure;
+        if (step != null) {
+            bool known = step.InnerException is Problem;
+            return T(ex.Message) + (known ? "" : "\n" + step.InnerException.Message) + "\n[" + step.Step + "]";
+        }
+        return ex is Problem ? T(ex.Message) : T("failed") + "\n" + ex.Message;
+    }
 }
 internal static class Product {
     internal static string Version { get { return Assembly.GetExecutingAssembly().GetName().Version.ToString(3); } }

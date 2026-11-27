@@ -343,8 +343,109 @@ internal static class Checks {
                     Check(File.ReadAllText(save) == "second" && !File.Exists(Path.Combine(root,"escape")));
                 }
                 break;
+            case "logs":
+                LogChecks(root);
+                break;
+            case "moveSteps":
+                MoveStepChecks(root);
+                break;
+            case "restoreFails":
+                RestoreFailureChecks(root);
+                break;
             default: throw new ArgumentException(suite);
+        }
+    }
+    static string Step(Action action) {
+        try { action(); } catch (StepFailure ex) { return ex.Step; }
+        throw new InvalidOperationException("Unexpected success");
+    }
+    static void LogChecks(string root) {
+        string log = Path.Combine(root,"crashes.log");
+        Func<int,string> rotated = n => log + "." + n;
+        // missing and zero-byte logs never rotate, whatever the cap
+        Check(!LogRotation.Rotate(log,10,3,null));
+        File.WriteAllBytes(log,new byte[0]);
+        Check(!LogRotation.Rotate(log,1,3,null) && File.Exists(log) && !File.Exists(rotated(1)));
+        // boundary: cap-1 stays, exactly cap rotates
+        File.WriteAllBytes(log,new byte[9]);
+        Check(!LogRotation.Rotate(log,10,3,null) && File.Exists(log));
+        File.WriteAllBytes(log,new byte[10]);
+        Check(LogRotation.Rotate(log,10,3,null) && !File.Exists(log) && new FileInfo(rotated(1)).Length == 10);
+        // keep-N: generations shift and the oldest falls off
+        for (int g = 2; g <= 5; g++) { File.WriteAllText(log,"generation" + g + "....."); Check(LogRotation.Rotate(log,10,3,null)); }
+        Check(File.ReadAllText(rotated(1)).StartsWith("generation5") && File.ReadAllText(rotated(2)).StartsWith("generation4") &&
+            File.ReadAllText(rotated(3)).StartsWith("generation3") && !File.Exists(rotated(4)));
+        // a smaller keep than before also clears stale older generations
+        File.WriteAllText(rotated(4),"stale");
+        File.WriteAllText(log,"generation6.....");
+        Check(LogRotation.Rotate(log,10,3,null) && !File.Exists(rotated(4)));
+        // the current session's file is never rotated away
+        File.WriteAllText(log,"current session file");
+        Check(!LogRotation.Rotate(log,10,3,log) && File.ReadAllText(log) == "current session file");
+        // a file the writer still holds open is left alone and nothing is lost
+        string before = File.ReadAllText(rotated(1));
+        using (new FileStream(log,FileMode.Open,FileAccess.ReadWrite,FileShare.None))
+            Check(!LogRotation.Rotate(log,10,3,null));
+        Check(File.ReadAllText(log) == "current session file" && File.ReadAllText(rotated(1)) == before);
+        Reject(() => LogRotation.Rotate(log,0,3,null)); Reject(() => LogRotation.Rotate(log,10,0,null));
+        Check(LogRotation.MaxBytes > 0 && LogRotation.Keep > 0);
+    }
+    static IEnumerable<string> Leftovers(string folder) {
+        return Directory.EnumerateFileSystemEntries(folder,".kelvaroq-*");
+    }
+    static void MoveStepChecks(string root) {
+        string parent = Path.Combine(root,"volume"), source = Path.Combine(parent,"old"), dest = Path.Combine(parent,"new");
+        Directory.CreateDirectory(Path.Combine(source,"sub"));
+        File.WriteAllText(Path.Combine(source,"one"),"original"); File.WriteAllText(Path.Combine(source,"sub","two"),"second");
+        // every step before the point of no return fails with its own name and changes nothing
+        foreach (string step in Relocation.Steps) {
+            var selected = new List<bool>();
+            Check(Step(() => Relocation.Move(source,dest,n => {},selected.Add,s => { if (s == step) throw new IOException("injected"); })) == step);
+             Check(!Directory.Exists(dest) && File.ReadAllText(Path.Combine(source,"one")) == "original" &&
+                File.ReadAllText(Path.Combine(source,"sub","two")) == "second" && Files.Size(source) == 14);
+            Check(!selected.Any() || !selected.Last());
+            Check(!Leftovers(parent).Any());
+        }
+        // checksum failure on the copy is its own step, not a silent success
+        Check(Step(() => Relocation.Move(source,dest,n => {},delegate {},s => {
+            if (s == "verify-checksums") foreach (string copy in Directory.EnumerateFiles(parent,"one",SearchOption.AllDirectories).Where(c => Path.GetFileName(Path.GetDirectoryName(c)).StartsWith(".kelvaroq-"))) {
+                File.WriteAllText(copy,"corrupt!!"); }
+        })) == "verify-checksums");
+         Check(!Directory.Exists(dest) && File.ReadAllText(Path.Combine(source,"one")) == "original" && !Leftovers(parent).Any());
+        // while the move is in flight a marker names the move; the source is untouched until the flip
+        bool marked = false;
+        Relocation.Move(source,dest,n => {},delegate {},s => {
+            if (s == "copy") { marked = Leftovers(parent).Any(p => p.EndsWith(".move")); Check(Files.Size(source) == 14); }
+        });
+        Check(marked && !Leftovers(parent).Any() && !Directory.Exists(source) && File.ReadAllText(Path.Combine(dest,"one")) == "original");
+    }
+    static void RestoreFailureChecks(string root) {
+        string history = Path.Combine(root,"snapshots");
+        var p = new Preferences { data = Path.Combine(root,"data"), cache = Path.Combine(root,"cache") };
+        Directory.CreateDirectory(p.data); string save = Path.Combine(p.data,"save");
+        File.WriteAllText(save,"live");
+        string good = Archives.Write(p.data,history,"abc","manual","sample");
+        File.WriteAllText(save,"newer");
+        // an archive that fails verification still leaves a snapshot of the state it would have replaced
+        string bad = Path.Combine(root,"bad.zip"); File.WriteAllText(bad,"invalid");
+        Reject(() => Archives.Restore(bad,p,history,"def"));
+        var taken = Archives.History(history).Where(s => !s.Damaged && s.Info.reason == "beforeRestore").ToList();
+        Check(taken.Count == 1 && File.ReadAllText(save) == "newer");
+        Archives.Restore(taken[0].Path,p,history,"def"); Check(File.ReadAllText(save) == "newer");
+        // a failure at either publish point after the snapshot leaves the live data as it was
+        foreach (string point in new[]{"publish","swap"}) {
+            File.WriteAllText(save,"before-" + point);
+            int count = Archives.History(history).Count;
+            Check(Step(() => Archives.Restore(good,p,history,"def",s => { if (s == point) throw new IOException("injected"); })) == point);
+            Check(File.ReadAllText(save) == "before-" + point && Archives.History(history).Count == count + 1);
+            Check(Archives.History(history).Any(s => s.Info.reason == "beforeRestore"));
+            Check(!Leftovers(root).Any());
         }
     }
 }
 }
+
+
+
+
+
