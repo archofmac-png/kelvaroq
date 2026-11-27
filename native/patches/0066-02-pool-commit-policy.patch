@@ -1,0 +1,90 @@
+diff --git a/crates/victory-gpu/src/inplace/pool.rs b/crates/victory-gpu/src/inplace/pool.rs
+index 6af9683..ac95e65 100644
+--- a/crates/victory-gpu/src/inplace/pool.rs
++++ b/crates/victory-gpu/src/inplace/pool.rs
+@@ -60,13 +60,13 @@ impl Drop for PoolCommit {
+     }
+ }
+ 
+-/// Default to openable sections within the commit and opening budgets.
+-/// VICTORY_UMA=0 restores reserved sections and the legacy copy path.
++/// Opt in: SEC_COMMIT charges whole slabs at allocation, ahead of use.
++/// Net cost versus reserved sections, including teardown, is unmeasured.
+ pub fn uma_pool() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+     *ON.get_or_init(|| {
+         std::env::var_os("VICTORY_UMA").is_none_or(|v| v != "0")
+-            && std::env::var_os("VICTORY_UMA_POOL").is_none_or(|v| v != "0")
++            && std::env::var_os("VICTORY_UMA_POOL").is_some_and(|v| v == "1")
+     })
+ }
+ 
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index 4efb40c..e415afb 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -1476,6 +1476,64 @@ mod tests {
+         assert!(!fallback.contains("System commit:"));
+     }
+ 
++    #[test]
++    fn pool_commit_budget_falls_back_to_an_uncharged_reserved_section() {
++        const CHILD: &str = "VICTORY_POOL_COMMIT_BUDGET_TEST_CHILD";
++        if std::env::var_os(CHILD).is_none() {
++            // Isolate the cached policy and charge counter from other allocators.
++            let output = std::process::Command::new(std::env::current_exe().unwrap())
++                .args(["modules::xmem::tests::pool_commit_budget_falls_back_to_an_uncharged_reserved_section", "--exact", "--nocapture"])
++                .env(CHILD, "1")
++                .env("VICTORY_UMA", "1")
++                .env("VICTORY_UMA_POOL", "1")
++                .env("VICTORY_UMA_POOL_COMMIT_MB", "1")
++                .env("VICTORY_LAZY_REMAP", "0")
++                .output().unwrap();
++            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
++            return;
++        }
++        if on_wine() {
++            eprintln!("Wine commits sections whole; Windows reserve fallback not exercised");
++            return;
++        }
++        assert!(victory_gpu::uma_pool());
++        let mut count = MIB / PAGE;
++        let mut charged = vec![0; count];
++        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, charged.as_mut_ptr()), 1);
++        assert!(physical().pages[&charged[0]].section.committed_whole);
++        assert!(victory_gpu::PoolCommit::reserve(1).is_none(), "budget is full");
++
++        let mut fallback = [0];
++        let mut one = 1;
++        assert_eq!(XMemAllocatePhysicalPages(0, &mut one, fallback.as_mut_ptr()), 1);
++        let section = physical().pages[&fallback[0]].section.clone();
++        assert!(!section.committed_whole);
++        // Inspect the kernel state before any page of this section is committed.
++        unsafe {
++            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
++            let view = MapViewOfFile(section.handle, FILE_MAP_WRITE, 0, 0, PAGE);
++            assert!(!view.Value.is_null());
++            assert_eq!(query(view.Value).host.State, MEM_RESERVE);
++            assert_ne!(UnmapViewOfFile(view), 0);
++        }
++        assert!(victory_gpu::title_memory_section_closed(section.handle as usize).is_none(),
++            "fallback must not attach a commit charge");
++        // The reserved fallback remains usable through the normal per-page commit.
++        let at = XMemVirtualAlloc(std::ptr::null_mut(), PAGE,
++            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
++        assert!(!at.is_null());
++        assert_eq!(XMemMapPhysicalPages(at, 1, fallback.as_ptr()), at);
++        unsafe { at.cast::<u32>().write(73); }
++        assert_eq!(unsafe { at.cast::<u32>().read() }, 73);
++        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
++        assert_eq!(XMemFreePhysicalPages(1, fallback.as_ptr()), 1);
++        drop(section);
++        assert_eq!(XMemFreePhysicalPages(count, charged.as_ptr()), 1);
++        assert!(victory_gpu::PoolCommit::reserve(MIB as u64).is_some(),
++            "freeing the committed slab restores the entire budget");
++        assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
++    }
++
+     #[test]
+     fn committed_pool_alias_crosses_a_slab_boundary_and_can_be_remapped() {
+         let slab = 64 * MIB / PAGE;
