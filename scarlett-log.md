@@ -8,8 +8,17 @@ Title timing, capture comparison and hardware-vendor costs remain unverified.
 Broader diagnostics depth-bounds/stack-walker issues from 0065 remain unresolved.
 Current response and checks: [Lane A round 2](docs/uma-0066.md).
 External-data measurement protocol remains in [0065](docs/uma-0065.md).
+Removal preservation is opt-in; live title resume remains unsupported.
+Removal checks and limits: [0067](docs/removal-0067.md).
 
 ## Sessions
+
+### 2026-11-26 (3) — Added default-off removal preservation and safe exit
+<!-- session: lane-a-0067-20261126-7e43 -->
+- DONE: 65 launcher, 281 GPU, 113 HLE, 39 loader and 7 removal checks passed; series verified. See [report](docs/removal-0067.md).
+- DECIDED: Verified forensic generations; unsafe-resume exit. Live title resume remains unsupported.
+- UNVERIFIED: Unsaved progress retention. Two broad-suite rectangle-validator failures reproduce on unchanged 0066.
+- NEXT: Establish replayable CPU/GPU checkpoints before live resume.
 
 ### 2026-11-26 (2) — Repaired constant overlap and re-gated pool commitment
 <!-- session: lane-a-0066-20261126-b5c4 -->
