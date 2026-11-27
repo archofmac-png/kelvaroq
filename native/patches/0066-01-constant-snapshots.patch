@@ -1,0 +1,364 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index bcd0d58..3ace951 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2097,8 +2097,6 @@ struct Deferred {
+     /// The range also tells the relay which older writes they can observe.
+     direct: std::collections::HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+     pool_bound: Option<usize>,
+-    pool_constants: Vec<std::sync::Arc<crate::inplace::pool::PoolBuffer>>,
+-    private_constants: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+     direct_requests: u64,
+     direct_bytes: u64,
+     /// Textures whose contents the list brings up to date.
+diff --git a/crates/victory-gpu/src/host/uma.rs b/crates/victory-gpu/src/host/uma.rs
+index b4a1ca6..a682600 100644
+--- a/crates/victory-gpu/src/host/uma.rs
++++ b/crates/victory-gpu/src/host/uma.rs
+@@ -23,9 +23,10 @@ pub(super) fn prepare_directory(
+     reads
+ }
+ 
+-/// A detached recording owns its dynamic constant slots until its fence.
+-/// Resolve a pool offset here because the title can remap the address
+-/// after recording. A borrowed recording keeps its replayable upload slot.
++/// Rebind one-shot constants to an immutable snapshot owned by this recording.
++/// Opened private heaps cannot be write-protected, and pool write windows bypass
++/// title-view guards. Neither kind can safely expose mutable producer bytes.
++/// A borrowed or replayed recording keeps its ordinary submission-time fill.
+ pub(super) fn bind_constants(
+     device: &ID3D12Device,
+     owner: &crate::list::Detached,
+@@ -33,86 +34,53 @@ pub(super) fn bind_constants(
+     fills: &mut std::collections::HashSet<usize>,
+ ) {
+     if !owner.whole_recording
+-        || flying()
+         || !runs.first().is_some_and(|&r| std::ptr::eq(r, owner.host()))
+-        || runs
+-            .iter()
+-            .filter(|&&r| std::ptr::eq(r, owner.host()))
+-            .count()
+-            != 1
++        || runs.iter().filter(|&&r| std::ptr::eq(r, owner.host())).count() != 1
++        || runs.iter().any(|l| l.deferred().copies.iter()
++            .any(|s| matches!(s, Step::GpuWrite(..) | Step::Run(_) | Step::Copy(..) | Step::Host(_))))
+     {
+         return;
+     }
+-    let Some(_mapping) = crate::watch::title_memory_reading_now() else {
+-        return;
+-    };
+-    // A write through another view of this section can have a different
+-    // virtual address. Keep the shadow for submissions with GPU writers.
+-    if runs.iter().any(|l| {
+-        l.deferred()
+-            .copies
+-            .iter()
+-            .any(|s| matches!(s, Step::GpuWrite(..) | Step::Run(_) | Step::Copy(..)))
+-    }) {
+-        return;
+-    }
+-    let mut recording = owner.host().deferred();
+-    if recording.submitted {
+-        return;
+-    }
+-    let mut keep = Vec::new();
+-    let mut private = std::collections::BTreeMap::new();
+-    for step in &recording.copies {
+-        let &Step::Fill(dst, src, bytes, Some(slot)) = step else {
+-            continue;
+-        };
++    let recording = owner.host().deferred();
++    if recording.submitted { return; }
++    let candidates: Vec<_> = recording.copies.iter().filter_map(|step| {
++        let &Step::Fill(dst, src, bytes, Some(slot)) = step else { return None };
+         if !(1..=65536).contains(&bytes) || src % 256 != 0 || fills.contains(&dst) {
+-            continue;
++            return None;
+         }
+-        let size = bytes.next_multiple_of(256);
+-        let section = crate::inplace::pool::constants()
+-            .then(|| crate::inplace::pool::resolve(device, src, size))
+-            .flatten();
+-        let location = if let Some((section, offset)) = section {
+-            let location = section.gpu + offset;
+-            keep.push(section);
+-            crate::inplace::pool::note_constant(bytes);
+-            location
+-        } else if crate::inplace::private_constants() {
+-            let start = src & !65535;
+-            let Some(end) = src
+-                .checked_add(size)
+-                .and_then(|e| e.checked_next_multiple_of(65536))
+-            else {
+-                continue;
+-            };
+-            let entry = private.entry((start, end)).or_insert_with(|| {
+-                let placed =
+-                    crate::inplace::place_for(start as u64, (end - start) as u64, true, true)?;
+-                Some(std::sync::Arc::new(crate::shadow::Shadow::placed(
+-                    placed,
+-                    start as u64,
+-                    (end - start) as u64,
+-                    true,
+-                )))
+-            });
+-            let Some(shadow) = entry else { continue };
+-            crate::inplace::skipped(1, bytes as u64);
+-            shadow.gpu(src as u64)
+-        } else {
+-            continue;
+-        };
+-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+-            BufferLocation: location,
+-            SizeInBytes: size as u32,
++        let enabled = match crate::inplace::cover(src, bytes) {
++            crate::inplace::Cover::Run(..) => crate::inplace::pool::constants(),
++            crate::inplace::Cover::None => crate::inplace::private_constants(),
++            _ => false,
+         };
+-        // SAFETY: the section covers the rounded CBV and the recording
+-        // retains it. Only this detached list can use the fresh slot.
+-        unsafe { device.CreateConstantBufferView(Some(&desc), slot) };
++        enabled.then_some((dst, src, bytes, slot))
++    }).collect();
++    drop(recording);
++    for (dst, src, bytes, slot) in candidates {
++        if fills.contains(&dst) { continue; }
++        let size = bytes.next_multiple_of(256);
++        let Some((gpu, snapshot)) = owner.host().scratch(size as u64) else { continue };
++        // Use the remap-aware transport, just like the ordinary Fill. Only the
++        // recording owns this destination; the title cannot mutate it in flight.
++        let began = std::time::Instant::now();
++        copy_mapped(snapshot, src as *const u8, bytes, false);
++        // Initialize CBV padding too; all bytes reachable by the descriptor belong
++        // to this snapshot rather than an adjacent scratch allocation.
++        unsafe { std::ptr::write_bytes(snapshot.add(bytes), 0, size - bytes) };
++        unsafe { device.CreateConstantBufferView(Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
++            BufferLocation: gpu, SizeInBytes: size as u32,
++        }), slot) };
+         fills.insert(dst);
++        // One snapshot replaces the legacy fill, rather than adding a second copy.
++        #[cfg(feature = "diagnostics")]
++        {
++            use crate::copystat::{C, add};
++            add(C::Copies, 1);
++            add(C::CopyBytes, bytes as u64);
++        }
++        PREPARING[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
++        PREPARING[1].fetch_add(bytes as u64, Ordering::Relaxed);
+     }
+-    recording.pool_constants = keep;
+-    recording.private_constants = private.into_values().flatten().collect();
+ }
+ 
+ #[cfg(test)]
+@@ -120,37 +88,28 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn read_only_table_constant_keeps_its_section_without_an_upload_fill() {
+-        const CHILD: &str = "KELVAROQ_UMA_CONSTANT_TEST_CHILD";
++    fn bound_constants_survive_overwrite_before_the_next_frame() {
++        const CHILD: &str = "KELVAROQ_UMA_OVERWRITE_CHILD";
+         if std::env::var_os(CHILD).is_none() {
+-            // Other tests remap pages and submit writers. Exercise this
+-            // read-only submission in a process with no unrelated flights.
+             let output = std::process::Command::new(std::env::current_exe().unwrap())
+-                .args(["host::uma::tests::read_only_table_constant_keeps_its_section_without_an_upload_fill", "--exact", "--nocapture"])
+-                .env(CHILD, "1").output().unwrap();
++                .args(["host::uma::tests::bound_constants_survive_overwrite_before_the_next_frame", "--exact", "--nocapture"])
++                .env(CHILD, "1").env("VICTORY_D3D12_WARP", "1")
++                .env("VICTORY_UMA", "1").env("VICTORY_UMA_PRIVATE", "1")
++                .env("VICTORY_UMA_PRIVATE_CBV", "1").env("VICTORY_UMA_POOL", "1")
++                .env("VICTORY_UMA_POOL_CBV", "1")
++                .env("VICTORY_LATE_WAIT", "1").env("VICTORY_RELAY", "0")
++                .env_remove("VICTORY_GPU_TIMING").output().unwrap();
+             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+             return;
+         }
+-        if !crate::inplace::pool::constants() || host().is_none() {
+-            eprintln!("UMA constants or D3D12 unavailable; direct constant check not exercised");
+-            return;
++        assert!(host().is_some(), "WARP must exercise the regression");
++        for overlap in [false, true] {
++            detached_constant(false, overlap);
++            detached_constant(true, overlap);
+         }
+-        detached_constant(false);
+     }
+ 
+-    #[test]
+-    #[ignore = "requires diagnostics, WARP and the UMA pool"]
+-    fn warp_detached_constant_keeps_the_selected_physical_offset() {
+-        detached_constant(false);
+-    }
+-
+-    #[test]
+-    #[ignore = "requires diagnostics, WARP and private constant views"]
+-    fn warp_detached_constant_reads_a_private_page() {
+-        detached_constant(true);
+-    }
+-
+-    fn detached_constant(private: bool) {
++    fn detached_constant(private: bool, overlap: bool) {
+         use windows_sys::Win32::{
+             Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+             System::Memory as mem,
+@@ -177,7 +136,7 @@ mod tests {
+             assert!(!data.Value.is_null());
+             data.Value.cast::<u32>().write(17);
+             data.Value.byte_add(page as usize).cast::<u32>().write(31);
+-            let guest = mem::MapViewOfFile(section, mem::FILE_MAP_READ, 0, page, page as usize);
++            let guest = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, page, page as usize);
+             assert!(!guest.Value.is_null());
+             crate::title_memory_section(section as usize, u64::from(page) * 2, true);
+             crate::title_memory_view(
+@@ -222,10 +181,10 @@ mod tests {
+             list.defer_constant_fill(fallback, src.cast(), 256, slot);
+             let code = compile(
+                 r#"
+-                cbuffer C : register(b0) { uint word; };
++                cbuffer C : register(b0) { uint4 words[16]; };
+                 RWByteAddressBuffer result : register(u0);
+                 [RootSignature("DescriptorTable(CBV(b0)),UAV(u0)")]
+-                [numthreads(1,1,1)] void main() { result.Store(0,word); }
++                [numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) { result.Store(id.x*4,words[id.x/4][id.x%4]); }
+             "#,
+                 windows::core::s!("main"),
+                 windows::core::s!("cs_5_1"),
+@@ -254,27 +213,49 @@ mod tests {
+             list.list.Dispatch(1, 1, 1);
+             list.close();
+             let owner = crate::list::Detached::for_test(list);
+-            let mut selected = Default::default();
+-            bind_constants(&host.device, &owner, &[owner.host()], &mut selected);
+-            assert!(selected.contains(&(fallback as usize)));
+-            assert_eq!(
+-                owner.host().deferred().pool_constants.len(),
+-                usize::from(!private)
+-            );
+-            assert_eq!(
+-                owner.host().deferred().private_constants.len(),
+-                usize::from(private)
+-            );
+-            // Poison the upload and remove its fill. The selected descriptor
+-            // must now read the second physical page on its own.
++            // Hold an older reader flight open. Rebinding must work while
++            // flying(), and a post-submit overwrite must preserve its bytes.
++            let gate: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
++            struct Release(ID3D12Fence);
++            impl Drop for Release {
++                fn drop(&mut self) { unsafe { self.0.Signal(1).unwrap() }; }
++            }
++            let release = Release(gate.clone());
++            host.queue.Wait(&gate, 1).unwrap();
++            let older = host.new_list().unwrap();
++            older.close();
++            if overlap { host.execute_own(&older, None); }
++            assert_eq!(flying(), overlap, "exercise both first-flight and overlapping binds");
+             fallback.cast::<u32>().write(12345);
+-            owner.host().deferred().copies.clear();
++            let (submitted, _) = host.submit(&[owner.host()], true, Some(&owner)).unwrap();
++            let target = *submitted;
++            drop(submitted);
++            assert_eq!(fallback.cast::<u32>().read(), 12345, "rebound snapshot replaces the legacy fill");
++            let address = src as usize;
++            let (started_tx, started) = std::sync::mpsc::channel();
++            let (done_tx, done) = std::sync::mpsc::channel();
++            let writer = std::thread::spawn(move || {
++                started_tx.send(()).unwrap();
++                std::ptr::write_bytes(address as *mut u8, 99, 256);
++                done_tx.send(()).unwrap();
++            });
++            started.recv().unwrap();
++            let early = done.recv_timeout(std::time::Duration::from_secs(2));
++            drop(release);
++            host.fence.SetEventOnCompletion(target, windows::Win32::Foundation::HANDLE::default()).unwrap();
++            writer.join().unwrap();
++            assert!(early.is_ok(), "producer overwrite is safe immediately after snapshotting");
++            let mut expected = [0u8; 256];
++            expected[..4].copy_from_slice(&(if private { 71u32 } else { 31u32 }).to_ne_bytes());
++            assert_eq!(std::slice::from_raw_parts(result, 256), expected);
++            assert_eq!(std::slice::from_raw_parts(src.cast::<u8>(), 256), [99; 256]);
++            settle_now(WHY_SYNC);
++            drop(older);
+             crate::title_memory_remapped(guest.Value as usize, page as usize);
+             assert_ne!(mem::UnmapViewOfFile(guest), 0);
+-            host.execute(&[owner.host()]);
+-            assert_eq!(result.cast::<u32>().read(), if private { 71 } else { 31 });
+             drop(owner);
+             if private {
++                crate::title_memory_remapped(private_base as usize, page as usize);
+                 assert_ne!(mem::VirtualFree(private_base, 0, mem::MEM_RELEASE), 0);
+             }
+             let _charge = crate::title_memory_section_closed(section as usize);
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index c1f8d7f..7650ee5 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -104,11 +104,13 @@ pub(crate) fn private_reads() -> bool {
+     })
+ }
+ 
+-/// Detached constants can open one or two private pages for a single list.
+-/// The hardware probe found opening itself costly, so measure it separately.
++/// Detached constants retain an immutable upload snapshot through their flight.
++/// Opt-in: opening private pages prevents write protection (see module probe),
++/// so direct binding cannot preserve submission-time bytes under overlap.
++/// Snapshot rebinding retains the copy and has no measured net timing win.
+ pub(crate) fn private_constants() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| private_reads() && std::env::var_os("VICTORY_UMA_PRIVATE_CBV").is_none_or(|v| v != "0"))
++    *ON.get_or_init(|| private_reads() && std::env::var_os("VICTORY_UMA_PRIVATE_CBV").is_some_and(|v| v == "1"))
+ }
+ 
+ /// The most title memory in place at once, in bytes
+diff --git a/crates/victory-gpu/src/inplace/pool.rs b/crates/victory-gpu/src/inplace/pool.rs
+index ac95e65..9a22a9e 100644
+--- a/crates/victory-gpu/src/inplace/pool.rs
++++ b/crates/victory-gpu/src/inplace/pool.rs
+@@ -100,7 +100,6 @@ pub(crate) struct PoolBuffer {
+     _charge: Option<Arc<PoolCommit>>,
+     _opening: Opening,
+     pub(crate) bytes: u64,
+-    pub(crate) gpu: u64,
+ }
+ 
+ struct Opening(u64);
+@@ -124,6 +123,7 @@ pub fn title_memory_section_closed(handle: usize) -> Option<Arc<PoolCommit>> {
+ 
+ /// An unbroken range of one committed section. A hole, a section
+ /// boundary or an exhausted budget leaves the caller its usual copy.
++#[cfg(test)]
+ pub(crate) fn resolve(
+     device: &ID3D12Device,
+     at: usize,
+@@ -200,7 +200,6 @@ fn lookup_with_budget(
+         REFUSED[5].fetch_add(1, Ordering::Relaxed);
+         return None;
+     };
+-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+     LIVE.fetch_add(size, Ordering::Relaxed);
+     let buffer = Arc::new(PoolBuffer {
+         buffer,
+@@ -208,7 +207,6 @@ fn lookup_with_budget(
+         _charge: v.charges.get(&handle).cloned(),
+         _opening: Opening(size),
+         bytes: size,
+-        gpu,
+     });
+     cache.insert(handle, buffer.clone());
+     Some((buffer, offset))
+@@ -276,10 +274,6 @@ pub(crate) fn note_read(bytes: usize) {
+     STATS[1].fetch_add(bytes as u64, Ordering::Relaxed);
+ }
+ 
+-pub(crate) fn note_constant(bytes: usize) {
+-    STATS[2].fetch_add(bytes as u64, Ordering::Relaxed);
+-}
+-
+ static RAW_TIMES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+ 
+ /// Count fence waits separately from page translation so a cheaper refresh
