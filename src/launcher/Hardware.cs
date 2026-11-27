@@ -22,6 +22,8 @@ internal sealed class Gpu {
     public bool? upload_heap { get; set; }
     public int wave_min { get; set; }
     public int wave_max { get; set; }
+    /// Display-class registry DriverDate for this adapter; null when it could not be matched.
+    internal DateTime? DriverDate;
 
     internal string VendorName {
         get {
@@ -62,6 +64,27 @@ internal sealed class Hardware {
         catch (UnauthorizedAccessException) { return null; }
         catch (System.IO.IOException) { return null; }
     }
+    /// Match each adapter to its display-class key by DriverDesc and read DriverDate ("M-d-yyyy").
+    static void FillDriverDates(Hardware machine) {
+        if (machine.gpus == null) return;
+        try {
+            using (var cls = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}")) {
+                if (cls == null) return;
+                foreach (string sub in cls.GetSubKeyNames()) {
+                    if (sub.Length != 4) continue;
+                    using (var key = cls.OpenSubKey(sub)) {
+                        if (key == null) continue;
+                        string desc = key.GetValue("DriverDesc") as string, stamp = key.GetValue("DriverDate") as string;
+                        DateTime when;
+                        if (desc == null || stamp == null || !DateTime.TryParseExact(stamp,"M-d-yyyy",
+                            CultureInfo.InvariantCulture,DateTimeStyles.None,out when)) continue;
+                        foreach (var gpu in machine.gpus.Where(g => !g.DriverDate.HasValue && String.Equals(g.name,desc,StringComparison.OrdinalIgnoreCase)))
+                            gpu.DriverDate = when;
+                    }
+                }
+            }
+        } catch (Exception) {}
+    }
     internal static Hardware Detect() {
         var machine = new Hardware();
         try {
@@ -71,6 +94,7 @@ internal sealed class Hardware {
         } catch (DllNotFoundException) {}
           catch (EntryPointNotFoundException) {}
           catch (BadImageFormatException) {}
+        FillDriverDates(machine);
         machine.Cpu = ReadName(@"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0","ProcessorNameString");
         machine.Build = ReadName(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion","CurrentBuildNumber");
         return machine;

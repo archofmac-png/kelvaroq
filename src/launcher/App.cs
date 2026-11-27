@@ -88,11 +88,13 @@ internal static class App {
         var locale = new Locale("system");
         bool demo = args.Length > 0 && args[0] == "--ui-demo";
         bool test = args.Length == 2 && args[0] == "--self-test";
+        bool doctor = args.Length >= 1 && args[0] == "--doctor";
         string home = demo || test ? Files.Unique(Path.GetTempPath()) :
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"Kelvaroq");
         try {
             Directory.CreateDirectory(home);
             if (test) { Checks.Run(args[1],home); return 0; }
+            if (doctor) return Preflight.RunDoctor(args,home);
             FileStream session;
             try { session = new FileStream(Path.Combine(home,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None); }
             catch (IOException) { throw new Problem("alreadyOpen"); }
@@ -109,7 +111,7 @@ internal static class App {
                 return window.ExitStatus;
             }
         } catch (Exception ex) {
-            if (test || (demo && args.Length > 1)) Console.Error.WriteLine(ex);
+            if (test || doctor || (demo && args.Length > 1)) Console.Error.WriteLine(ex);
             else MessageBox.Show(locale.Error(ex),"Kelvaroq",MessageBoxButton.OK,MessageBoxImage.Error);
             return 1;
         } finally { if (demo || test) Files.RemoveTree(home); }

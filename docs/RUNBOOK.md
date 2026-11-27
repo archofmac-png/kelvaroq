@@ -39,6 +39,21 @@ of the *runtime* are safe to use; a single small `.exe` claiming to install the 
    the difference between playing and watching dropped draws.
 4. First run only: expect a long shader warm. Leave it.
 
+## 2b. Preflight and doctor
+
+The launcher refuses to start when a blocking check fails, with a one-line fix. Blocking: commit
+limit < 80 GiB, VRAM < 12 GiB, no FL 12_0 / SM 6.6 / mesh shaders, game directory or `appdata0.rpf`
+missing, cold pipeline cache (file checks as in `bench/heavy.ps1`), another engine running.
+Advisory (warn only): RAM < 32 GiB, driver older than 6 months, no XInput pad, non-ASCII path.
+12-16 GiB VRAM warns.
+
+`VICTORY_SKIP_PREFLIGHT=1` overrides the blocking set (only the exact value `1`); the launcher
+prints which checks it overrode.
+
+`kelvaroq-desktop.exe --doctor [exe-or-folder]` runs every check, prints a table, never launches,
+and exits 0 (nothing blocks) or 2 (something blocks). The launcher is a windows-subsystem exe, so
+a shell does not wait for it: use `Start-Process -Wait -PassThru` or `cmd /c start /wait`.
+
 ## 3. Failure modes
 
 ### Cold pipeline cache

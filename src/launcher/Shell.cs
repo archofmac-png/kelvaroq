@@ -249,6 +249,10 @@ internal sealed class Shell : Window {
     void Launch() {
         if (demo || working) return;
         var game = Installation.Select(prefs.executable); Files.Separate(game.Root,prefs.ActiveData); Files.Separate(game.Root,prefs.ActiveCache);
+        // Blocking preflight checks: throws PreflightBlocked (shown by Guard) unless VICTORY_SKIP_PREFLIGHT=1.
+        // When overridden, the exact list of overridden checks replaces the status line and goes to stderr.
+        string overridden = Preflight.Enforce(PreflightFacts.Live(hardware,game.Root,game.Image,prefs.ActiveCache));
+        if (overridden.Length > 0) Console.Error.WriteLine(overridden);
         var command = Product.Command(game,prefs,locale,experimental,dark,hardware);
         Work(() => Task.Run(delegate {
             bool snapshots = Product.Enabled("VICTORY_SAVE_HISTORY") && Product.Enabled("VICTORY_SAVE_SNAPSHOTS");
@@ -259,7 +263,7 @@ internal sealed class Shell : Window {
                 }
             });
             if (ExitStatus != 0) throw new IOException(T("exitError",ExitStatus) + "\n" + error.Trim());
-        }),T("running"));
+        }),overridden.Length > 0 ? overridden : T("running"));
     }
     string Size(long n) {
         var unit = n >= 1073741824 ? "GiB" : n >= 1048576 ? "MiB" : n >= 1024 ? "KiB" : "B";

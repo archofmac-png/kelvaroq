@@ -391,6 +391,10 @@ mod launcher {
             desktop_test("hardware");
         }
         #[test]
+        fn preflight_blocking_advisory_override_and_doctor() {
+            desktop_test("preflight");
+        }
+        #[test]
         fn release_tags_and_notes() {
             desktop_test("releases");
         }

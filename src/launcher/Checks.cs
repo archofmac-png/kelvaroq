@@ -70,6 +70,118 @@ internal static class Checks {
             Environment.SetEnvironmentVariable("VICTORY_LAUNCHER_HARDWARE",oldDetection);
         }
     }
+    // ---- preflight fixtures: empty placeholder files only, no title data ----
+    static readonly DateTime FixtureNow = new DateTime(2026,11,26,12,0,0,DateTimeKind.Utc);
+    static PreflightFacts Healthy(string root) {
+        string dir = Files.Unique(root), game = Path.Combine(dir,"title"), cache = Path.Combine(dir,"cache");
+        Directory.CreateDirectory(Path.Combine(cache,"pipelines","warm-v1")); Directory.CreateDirectory(Path.Combine(cache,"shaders"));
+        File.WriteAllText(Path.Combine(cache,"pipelines","warm-v1","r1"),"x");
+        File.WriteAllText(Path.Combine(cache,"pipelines","precompiled-v1.txt"),"receipt");
+        Directory.CreateDirectory(game);
+        File.WriteAllBytes(Path.Combine(game,"sample.exe"),new byte[0]);
+        File.WriteAllBytes(Path.Combine(game,"appdata0.rpf"),new byte[0]);
+        var hardware = Hardware.Sample(); hardware.Preferred.DriverDate = FixtureNow.AddMonths(-1);
+        return new PreflightFacts { CommitLimit = 96L << 30, Hardware = hardware, GameRoot = game,
+            Image = Path.Combine(game,"sample.exe"), CacheDir = cache, Engines = new List<string>(),
+            Gamepad = true, RunPaths = new[]{@"C:\vt\kelvaroq-desktop.exe"}, Now = FixtureNow };
+    }
+    static PreflightResult Result(PreflightFacts f,string id) { return Preflight.Run(f).Single(r => r.Id == id); }
+    static void Verdict(string root,string id,PreflightLevel expected,Action<PreflightFacts> change) {
+        var f = Healthy(root); change(f); var r = Result(f,id);
+        Check(r.Level == expected);
+        if (expected == PreflightLevel.Block) Check(r.Message.Contains("Fix:"));
+    }
+    static void RunPreflight(string root) {
+        string[] blocking = {"commit","vram","featureLevel","shaderModel","meshShaders","gameDir","archive","pipelineCache","engineRunning"};
+        string[] advisory = {"ram","driverAge","gamepad","asciiPath"};
+        var clean = Preflight.Run(Healthy(root));
+        Check(blocking.Concat(advisory).OrderBy(x => x).SequenceEqual(clean.Select(r => r.Id).OrderBy(x => x)));
+        Check(clean.All(r => r.Level == PreflightLevel.Pass) && !Preflight.Blocked(clean));
+        Check(blocking.All(id => !clean.Single(r => r.Id == id).Advisory) && advisory.All(id => clean.Single(r => r.Id == id).Advisory));
+
+        // commit limit: 80 GiB is the line (docs/RUNBOOK.md section 0)
+        Verdict(root,"commit",PreflightLevel.Pass,f => f.CommitLimit = 80L << 30);
+        Verdict(root,"commit",PreflightLevel.Block,f => f.CommitLimit = (80L << 30) - 1);
+        Check(Result(new Func<PreflightFacts>(() => { var f = Healthy(root); f.CommitLimit = 60L << 30; return f; })(),"commit").Message.Contains("paging file"));
+        Verdict(root,"commit",PreflightLevel.Warn,f => f.CommitLimit = null);
+        // VRAM: block under 12, warn 12..16, pass at 16
+        Verdict(root,"vram",PreflightLevel.Block,f => f.Hardware.Preferred.vram = 8L << 30);
+        Verdict(root,"vram",PreflightLevel.Warn,f => f.Hardware.Preferred.vram = 12L << 30);
+        Verdict(root,"vram",PreflightLevel.Warn,f => f.Hardware.Preferred.vram = 15L << 30);
+        Verdict(root,"vram",PreflightLevel.Pass,f => f.Hardware.Preferred.vram = 16L << 30);
+        Verdict(root,"vram",PreflightLevel.Warn,f => f.Hardware = null);
+        // device capabilities: only a definite "no" blocks; unknown is a warning
+        Verdict(root,"featureLevel",PreflightLevel.Block,f => f.Hardware.Preferred.fl12 = false);
+        Verdict(root,"shaderModel",PreflightLevel.Block,f => f.Hardware.Preferred.sm66 = false);
+        Verdict(root,"shaderModel",PreflightLevel.Warn,f => f.Hardware.Preferred.sm66 = null);
+        Verdict(root,"meshShaders",PreflightLevel.Block,f => f.Hardware.Preferred.mesh = false);
+        Verdict(root,"meshShaders",PreflightLevel.Warn,f => f.Hardware.gpus = new Gpu[0]);
+        // files
+        Verdict(root,"gameDir",PreflightLevel.Block,f => f.GameRoot = Path.Combine(f.GameRoot,"missing"));
+        Verdict(root,"gameDir",PreflightLevel.Block,f => File.Delete(f.Image));
+        Verdict(root,"archive",PreflightLevel.Block,f => File.Delete(Path.Combine(f.GameRoot,"appdata0.rpf")));
+        Check(Result(new Func<PreflightFacts>(() => { var f = Healthy(root); File.Delete(Path.Combine(f.GameRoot,"appdata0.rpf")); return f; })(),"archive").Message.Contains("appdata0.rpf"));
+        // pipeline cache: the three cold states bench/heavy.ps1 Test-WarmCache refuses
+        Verdict(root,"pipelineCache",PreflightLevel.Block,f => f.CacheDir = Path.Combine(f.CacheDir,"absent"));
+        Verdict(root,"pipelineCache",PreflightLevel.Block,f => Files.RemoveTree(Path.Combine(f.CacheDir,"shaders")));
+        Verdict(root,"pipelineCache",PreflightLevel.Block,f => File.Delete(Path.Combine(f.CacheDir,"pipelines","warm-v1","r1")));
+        Verdict(root,"pipelineCache",PreflightLevel.Block,f => File.Delete(Path.Combine(f.CacheDir,"pipelines","precompiled-v1.txt")));
+        // another engine
+        Verdict(root,"engineRunning",PreflightLevel.Block,f => f.Engines.Add("kelvaroq-engine.exe (pid 4242)"));
+        Check(Result(new Func<PreflightFacts>(() => { var f = Healthy(root); f.Engines.Add("kelvaroq-engine.exe (pid 4242)"); return f; })(),"engineRunning").Message.Contains("4242"));
+
+        // advisory: warn, never block
+        Verdict(root,"ram",PreflightLevel.Warn,f => f.Hardware.ram = 16L << 30);
+        Verdict(root,"ram",PreflightLevel.Pass,f => f.Hardware.ram = 32L << 30);
+        Verdict(root,"driverAge",PreflightLevel.Warn,f => f.Hardware.Preferred.DriverDate = FixtureNow.AddMonths(-7));
+        Verdict(root,"driverAge",PreflightLevel.Pass,f => f.Hardware.Preferred.DriverDate = FixtureNow.AddMonths(-5));
+        Verdict(root,"driverAge",PreflightLevel.Skip,f => f.Hardware.Preferred.DriverDate = null);
+        Verdict(root,"gamepad",PreflightLevel.Warn,f => f.Gamepad = false);
+        Verdict(root,"gamepad",PreflightLevel.Skip,f => f.Gamepad = null);
+        Verdict(root,"asciiPath",PreflightLevel.Warn,f => f.RunPaths = new[]{"C:\\Jeux\\Caf\u00e9\\game.exe"});
+        var worst = Healthy(root); worst.Hardware.ram = 8L << 30; worst.Hardware.Preferred.DriverDate = FixtureNow.AddYears(-3);
+        worst.Gamepad = false; worst.RunPaths = new[]{"C:\\\u00e9"};
+        var advisoryOnly = Preflight.Run(worst);
+        Check(advisory.All(id => advisoryOnly.Single(r => r.Id == id).Level == PreflightLevel.Warn) && !Preflight.Blocked(advisoryOnly));
+        Check(Preflight.Gate(advisoryOnly,null).Proceed);
+        // a probe that throws can never block, advisory or not
+        foreach (bool isAdvisory in new[]{true,false}) {
+            var thrown = Preflight.Guarded("probe","Probe",isAdvisory,() => { throw new InvalidOperationException("boom"); });
+            Check(thrown.Level == PreflightLevel.Warn && thrown.Message.Contains("boom"));
+        }
+
+        // override flag: honoured only as exactly "1", and prints exactly what it overrode
+        var blocked = Healthy(root); blocked.CommitLimit = 10L << 30; blocked.Engines.Add("victory.exe (pid 7)");
+        var results = Preflight.Run(blocked);
+        Check(Preflight.Blocked(results));
+        var stopped = Preflight.Gate(results,null);
+        Check(!stopped.Proceed && stopped.Report.Contains("commit") && stopped.Report.Contains("engineRunning") && !stopped.Report.Contains("launching despite") && stopped.Overridden.Count == 0);
+        foreach (string notOne in new[]{"","0","true","yes"}) Check(!Preflight.Gate(results,notOne).Proceed);
+        var skipped = Preflight.Gate(results,"1");
+        Check(skipped.Proceed && skipped.Report.Contains("VICTORY_SKIP_PREFLIGHT=1") && skipped.Overridden.Count == 2);
+        Check(skipped.Overridden.Select(r => r.Id).OrderBy(x => x).SequenceEqual(new[]{"commit","engineRunning"}));
+        Check(skipped.Overridden.All(r => skipped.Report.Contains(r.Message)) && !skipped.Report.Contains("vram"));
+        Check(Preflight.Gate(Preflight.Run(Healthy(root)),"1").Overridden.Count == 0 && Preflight.Gate(Preflight.Run(Healthy(root)),"1").Report == "");
+        string held = Environment.GetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT");
+        try {
+            Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT",null);
+            try { Preflight.Enforce(blocked); throw new InvalidOperationException("Unexpected success"); } catch (PreflightBlocked) {}
+            Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT","1");
+            Check(Preflight.Enforce(blocked).Contains("commit"));
+        } finally { Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT",held); }
+
+        // doctor: runs everything, prints a table, never launches
+        var output = new StringWriter();
+        Check(Preflight.Doctor(Healthy(root),output) == 0);
+        foreach (string id in blocking.Concat(advisory)) Check(output.ToString().Contains(id));
+        output = new StringWriter();
+        Check(Preflight.Doctor(blocked,output) == 2 && output.ToString().Contains("BLOCK") && output.ToString().Contains("commit"));
+        Check(Preflight.Doctor(worst,new StringWriter()) == 0);
+        // doctor ignores the override: it reports, it does not launch
+        var env = Environment.GetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT");
+        try { Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT","1"); Check(Preflight.Doctor(blocked,new StringWriter()) == 2); }
+        finally { Environment.SetEnvironmentVariable("VICTORY_SKIP_PREFLIGHT",env); }
+    }
     static void Reject(Action action) {
         try { action(); } catch (Exception ex) {
             if (ex is Problem || ex is InvalidDataException || ex is IOException || ex is ArgumentException) return;
@@ -84,6 +196,9 @@ internal static class Checks {
         switch (suite) {
             case "hardware":
                 HardwareProfiles(home,p);
+                break;
+            case "preflight":
+                RunPreflight(root);
                 break;
             case "releases":
                 const string fixture = "{\"tag_name\":\"v0.10.1\",\"body\":\"## Changes\\r\\n- Faster startup\",\"html_url\":\"https://example.invalid/\",\"draft\":false,\"prerelease\":false}";
