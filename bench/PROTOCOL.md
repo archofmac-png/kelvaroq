@@ -75,7 +75,8 @@ did not reach the scene.
 - One title process. No capture tool, no compiler, no other GPU load during the run.
 - Do **not** run with `VICTORY_CAPTURE`. A capture forces the synchronous present path and one
   frame slot (`0046-async-present-frame-waits.patch:1090-1094`), which is not the timed
-  configuration. Capture in a separate, untimed pass with the same save and keys, and diff.
+  configuration. Capture in a separate, untimed pass with `bench/capture.ps1` (same save, same
+  keys) and verify with `bench/render-verify.ps1`; see **Render gate** below.
 - Three runs per variant and at least 600 heavy frames in total (documentation.md:60). A single
   run is a screen, not a verdict. The script warns when per-run medians differ by more than the gate.
 
@@ -116,6 +117,101 @@ time, GPU busy, and the bucket table. It prints a **WARNING**, without changing 
 - the heavy-frame mix across draw buckets shifted by more than 15 points, so the pooled gate is
   comparing different parts of the scene.
 
+## Render gate (FORGE-BRIEF non-negotiable 1)
+
+**Policy.** A perf patch lands only if `render-verify.ps1` returns **0 or 1** against the stored
+reference. **2 or 3 blocks the merge regardless of the frame time**, and so does 4 (no verdict:
+the sets were not comparable) or 5 (the gate could not run). A faster frame on a changed picture
+is not a speedup (`heavy.ps1` prints the same warning when `drawn/draws` falls). The frame-time
+gate and the render gate are independent and both must pass; neither can buy back the other.
+
+| Exit | Meaning | Merge |
+|---|---|---|
+| 0 | every file byte-identical to the reference | allowed |
+| 1 | differences exist, all **sub-visible** (below the thresholds) | allowed, report pasted in the review |
+| 2 | at least one **visible** or **structural** difference, or a file with no reference counterpart | blocked |
+| 3 | at least one **missing** file; takes precedence over 2 | blocked |
+| 4 | **refused**: sets not comparable or invalid (see below). No verdict | blocked |
+| 5 | usage or environment error | blocked |
+
+### Capture
+
+```powershell
+# Reference: the build before the patch, the fixed save, the fixed keys, the fixed frames.
+./bench/capture.ps1 -Name ref-0066 -Frames 128,256,512 -Engine $engine -Image $image `
+    -DataDir $save -CacheDir $cache -KeysFile $keys
+
+# Candidate: the patched build on the same inputs. -ReplayFrom reuses the reference's frames,
+# keys, profile, file pattern and dump targets, and refuses a save whose tree hash differs.
+./bench/capture.ps1 -Name cand-0067 -ReplayFrom ref-0066 -Engine $engine2 -Image $image `
+    -DataDir $save -CacheDir $cache2
+
+./bench/render-verify.ps1 -Reference ref-0066 -Candidate cand-0067    # exit code per the table
+```
+
+Sets live in `bench/out/captures/<name>/` (gitignored). `capture.ps1` refuses an `-OutDir` inside
+the repository unless `git check-ignore` says it is ignored: a capture is a picture of the title.
+`docs/uma-0065.md:123` asks for capture paths outside the repository; an `-OutDir` outside it is
+always accepted and is the safer choice on a shared machine.
+
+A set holds `capture.json` (the sidecar), `keys.txt`, `engine.{out,err}.log` and `capture/`, the
+engine's files exactly as written. The sidecar records the frame list, the save-tree SHA-256
+(same algorithm as `heavy.ps1`'s `data_tree_sha256`), the keys SHA-256, the engine SHA-256, the
+console profile, the frame-file pattern, the dump-target setting, the full environment, the
+command line, a SHA-256 manifest of every file, and `status`.
+
+**What fixes the frames.** `VICTORY_KEYS` replays the same input, so the camera path is the same
+(its syntax is the fork's, not this tree's; the script passes it through and records its hash).
+`VICTORY_CAPTURE_FRAMES` names the frames and `VICTORY_DUMP_TARGETS` defaults to the same list
+(`-DumpTargets` overrides, `-NoDumpTargets` leaves it unset). Capture is synchronous, which removes
+the async-present reordering, but `docs/uma-0065.md:154` warns that scene timing can still move
+content between frame numbers. That is what the determinism control is for.
+
+**Crash safety.** A set is built in `<name>.partial-<pid>` and renamed to `<name>` only when every
+requested frame exists, every PNG ends in `IEND`, nothing changed for `-SettleSec`, and the
+sidecar is on disk (it is written last). Anything else is kept as
+`<name>.incomplete-<utc>` with `status: incomplete`, the missing and corrupt files listed, and
+exit 4. An incomplete set is a valid **candidate** (it verifies to exit 3) and is **never a
+reference**. A name is never overwritten. A reference that is later edited, truncated or
+added to is detected by its manifest and refused.
+
+### Verify
+
+1. **Exact.** SHA-256 per file. Equal bytes are `unchanged`.
+2. **Perceptual**, on files whose bytes differ and that are PNG (8 or 16 bit, not interlaced):
+   mean absolute difference per channel (R, G, B, A), share of pixels changed and visibly changed,
+   bounding box of the visible change, a tile grid of per-tile MAD (`-GridX`/`-GridY`, default 8x8),
+   and an edge-map comparison on luma. 16-bit input is compared on its high byte.
+3. **Class** per file:
+
+| Class | Rule (defaults) |
+|---|---|
+| `unchanged` | bytes equal |
+| `sub-visible` | pixels identical but bytes differ (encoder or metadata), or RGB MAD <= 0.5 and at most 0.05 % of pixels changed by >= 8 |
+| `visible` | RGB MAD > 0.5, or more than 0.05 % of pixels changed by >= 8 in some channel; **also any differing file that cannot be decoded**, so an unknown format never passes silently |
+| `structural` | the edge map moved: edge XOR >= 0.02 % of all pixels and >= 5 % of the edge union (luma gradient >= 24); or the dimensions differ |
+| `missing` | in the reference, not in the candidate |
+| `extra` | in the candidate, not in the reference (counts as exit 2) |
+
+**The thresholds are guesses, not calibrated against the title.** Before trusting the
+sub-visible / visible line: capture the *same* build twice under two names and verify one against
+the other. It must be exit 0. Anything else means the scene is not deterministic at those frames
+and the gate is measuring noise; pick different frames or fix the input script first. Then verify
+one deliberately changed build to see which class it lands in, and adjust the parameters
+(`-SubVisibleMad`, `-VisibleDelta`, `-VisiblePixelFraction`, `-EdgeThreshold`,
+`-StructuralEdgeRatio`, `-StructuralMinEdgeFraction`) once, in this file, with the numbers.
+
+**Refusals (exit 4).** The two sets must agree on: the declared frame list (count first, then the
+list), the save-tree hash, the keys hash, the console profile, the frame-file pattern and the
+dump-target setting. The reference must be `complete`. Every file in either set must match its
+manifest and nothing unrecorded may sit in `capture/`. A directory with no `capture.json`
+(a run that died before finishing) is not a set.
+
+**Report.** `bench/out/reports/verify-<candidate>-vs-<reference>.md` (and a `.json` twin) holds the
+exit and what it means, a class count, both sets' hashes, a per-file table (MAD per channel, max
+delta, changed and visible share, edge change) and, for every differing PNG, the bounding box,
+the worst tiles and the full tile grid. Paste the `.md` into the review.
+
 ## Output (`bench/out/<label>/`, gitignored)
 
 | File | Content |
@@ -132,8 +228,19 @@ its `meta.json`.
 
 ## Status of this harness
 
-Written and reviewed by reading. **It has not been executed**: the session that wrote it could not
-run PowerShell. First use on the test machine must start with `-Mode SelfTest`, then a
-`-Duration 60` smoke run with a cold-cache refusal check (`-CacheDir` pointing at an empty folder
-must exit 3). Unverified until then: that .NET opens `Local\KelvaroqStats-<pid>` verbatim, that
-robocopy `/DCOPY:DAT` keeps the receipt valid, and the VICTORY_KEYS replay timing above.
+Written and reviewed by reading. **None of `heavy.ps1`, `capture.ps1` or `render-verify.ps1` has
+been executed**: the sessions that wrote them could not run PowerShell. First use on the test
+machine must start with `-Mode SelfTest` on each. `heavy.ps1`: then a `-Duration 60` smoke run
+with a cold-cache refusal check (`-CacheDir` pointing at an empty folder must exit 3). Unverified
+until then: that .NET opens `Local\KelvaroqStats-<pid>` verbatim, that robocopy `/DCOPY:DAT`
+keeps the receipt valid, and the VICTORY_KEYS replay timing above.
+
+Render gate, unverified until a real capture exists, because the fork's `capture.rs` is not in
+this tree: that `VICTORY_CAPTURE` is a directory the engine fills; that it writes `frame-<N>.png`
+for each number in `VICTORY_CAPTURE_FRAMES` (`docs/uma-0065.md:158`, the only statement of the
+name; `-FramePattern` if it is wrong); that `VICTORY_DUMP_TARGETS` takes the same frame list
+(inferred only from `0046-async-present-frame-waits.patch:1074,1090`) and that its files land in
+the capture directory; the file format of the dumps (anything that is not PNG is compared by
+bytes only and any difference is `visible`). Also unverified: that `Add-Type` compiles the C#
+decoder as written, and that `Start-Process` runs the self-test's `.cmd` fake engine. After the
+self-tests pass, the first real step is one capture, then reading its `capture/` directory.
