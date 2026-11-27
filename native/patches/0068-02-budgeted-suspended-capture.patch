@@ -1,0 +1,1440 @@
+diff --git a/README.md b/README.md
+index 722117b..250ce52 100644
+--- a/README.md
++++ b/README.md
+@@ -232,31 +232,47 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
+ > moment). To look further, use a diagnostics build with
+ > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+ 
+-`VICTORY_RECOVER_REMOVAL=1` opts into removal preservation (default off;
+-keep it off by default until a title-equipped validation run). It enables
+-DRED before device creation and copies readable cloneable process RAM, saves
+-and persistent storage into `<title data>/recovery/snapshot-*` before exit.
+-Completed generations have a `COMPLETE` hash manifest; `.partial` directories
+-are incomplete and never replace an older generation. Guarded title RAM is
+-read from a clone without disarming the live guards. Each removal produces
+-one JSON line in `crashes.log`, with pending breadcrumb count (`null` when
+-unavailable), preserved artifacts, attempt status and outcome.
+-
+-This build cannot safely resume a running title: device children are cached
+-for process lifetime, and lost GPU writes have no replayable safe point.
+-It makes zero automatic title recovery attempts, exits with `0xE0670001`
+-after verified preservation (`0xE0670002` if preservation is incomplete),
+-and prints the recovery folder. These are **FORENSIC ONLY**, never loadable save states. The RAM file header
+-explicitly identifies that format. Threads currently keep running during the
+-clone/copy: title object graphs, allocator metadata, descriptors, command/fence
+-bookkeeping, save-operation buffers and storage can represent different instants
+-or interrupted updates. Non-cloneable/inaccessible mappings, OS handles and
+-GPU-only state are absent. Shared mappings can change even after cloning; RAM
+-and committed saves are not an atomic checkpoint. Unsaved progress is not guaranteed.
+-Do not copy partial files over live saves. The no-title WARP diagnostics
+-probe releases all old objects and verifies device/library/heap recreation
+-and submission three times, then refuses a fourth attempt. That probe is
+-not evidence of live title resume. With the flag off, legacy handling stays.
++`VICTORY_RECOVER_REMOVAL=1` opts into forensic capture (default off).
++After removal, a separate instance of this executable suspends every title
++process thread except a dedicated termination watchdog, then clones readable
++cloneable RAM and copies committed saves/storage under `<title data>/recovery`.
++The parent save mutex is held before suspension; a busy save is skipped and
++makes the generation incomplete. No capture, hashing or disk writes occur
++on a surviving title/frame thread. Guard flags are removed only in the clone.
++
++Every generation starts with a flushed `PARTIAL` marker. A loader must reject
++that marker even if `COMPLETE` exists, and reject every `.partial` directory.
++Each artifact is hashed while written; the `COMPLETE` manifest is written last,
++then the directory is renamed and `PARTIAL` removed. There is no exit-time
++artifact readback: verify hashes offline before using forensic evidence. A failed
++or externally killed capture keeps its partial generation and all older ones.
++
++The shared monotonic deadline starts at helper launch: 2,000 ms by default.
++`VICTORY_RECOVERY_BUDGET_MS` can select 50–10,000 ms. A dedicated watchdog in
++each process enforces it even if clone, read, flush or logging stalls, or the
++helper dies. Before cloning, an estimate includes readable committed RAM and
++save/storage file sizes: 250 ms + bytes / 64 MiB/s. This is a conservative
++admission policy, not measured throughput; oversize work exits early. Deadline
++exit is `0xE0680002`. Configure below the external watchdog; an external kill
++before our deadline can still interrupt any stage and cannot be prevented.
++
++These are **FORENSIC ONLY**, never loadable save states. The RAM file header
++(`SCARLRAM2FORENSIC_ONLY\n`) and each generation's README say so. Suspension
++is sequential and freezes arbitrary interrupted updates: title object graphs,
++allocator metadata, descriptors, command/fence bookkeeping and save buffers
++can already be inconsistent. After suspension, title writers stop, but kernel
++I/O, external writers and shared mappings can still change. Non-cloneable or
++inaccessible mappings, OS handles and GPU-only state are absent. RAM, committed
++saves and storage are not an atomic checkpoint; unsaved progress is not guaranteed.
++
++This build makes zero automatic title restart/replay attempts. Device children
++remain cached and lost GPU writes have no replayable safe point. Successful
++forensic capture exits `0xE0670001`; incomplete capture exits `0xE0670002`.
++One JSON event records artifacts, outcome and actual folder when reporting
++finishes within budget; a hard deadline can leave only `PARTIAL`. Keep all
++generations and never copy partial files over live saves. With the flag off,
++legacy handling remains. WARP reconstruction is an isolated no-title probe,
++not evidence of live title resume.
+ 
+ What each part does today and what it still needs:
+ 
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 498f16c..9aea9fe 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -141,6 +141,8 @@ enum Console {
+ }
+ 
+ fn main() -> Result<()> {
++    #[cfg(windows)]
++    victory_loader::recovery::worker::worker();
+     victory_core::logging::init("info");
+     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+     #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-hle/src/modules/d3d12x/recovery.rs b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+index 81f4154..4f0d003 100644
+--- a/crates/victory-hle/src/modules/d3d12x/recovery.rs
++++ b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+@@ -2,7 +2,10 @@
+ //! replaceable device generations. Never reinterpret a RAM dump as one.
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use victory_gpu::removal::Removal;
+-use victory_loader::recovery::{capture_ram, copy_tree, json_string, publish, write_verified};
++use victory_loader::recovery::{
++    json_string,
++    worker::{Request, launch},
++};
+ 
+ const UNSAFE_RESUME: u32 = 0xe0670001;
+ const PRESERVE_FAILED: u32 = 0xe0670002;
+@@ -21,90 +24,28 @@ fn enter_failure() {
+ pub(super) fn removed(event: &Removal) -> ! {
+     enter_failure();
+     let title = crate::runtime::title();
+-    let root = title.storage.with_file_name("recovery");
+-    let mut partial = None;
+-    let mut artifacts = Vec::new();
+-    let preserved = if title.storage.as_os_str().is_empty() {
+-        Err(std::io::Error::other("title storage not configured"))
+-    } else {
+-        publish(&root, |at| {
+-            partial = Some(at.to_owned());
+-            let mut errors = Vec::new();
+-            let mut record = |name, result: std::io::Result<()>| match result {
+-                Ok(()) => artifacts.push(name),
+-                Err(e) => errors.push(format!("{name}: {e}")),
+-            };
+-            record(
+-                "dred",
+-                write_verified(&at.join("dred.txt"), |out| {
+-                    out.write_all(event.dred.as_bytes())?;
+-                    out.write_all(event.fault.as_bytes())
+-                })
+-                .map(|_| ()),
+-            );
+-            // Attempt artifacts independently: an active save or a full disk
+-            // must not prevent trying to retain the other recoverable state.
+-            record("ram", capture_ram(&at.join("ram.bin")).map(|_| ()));
+-            // All XGameSave commits use this same lock. Do not block on a
+-            // possibly faulting thread; reject an inconsistent save copy.
+-            record(
+-                "saves",
+-                super::super::xgamesave::recovery_copy(&title.saves(), &at.join("saves")),
+-            );
+-            record("storage", copy_tree(&title.storage, &at.join("storage")));
+-            write_verified(&at.join("README.txt"), |out| {
+-                out.write_all(
+-                b"Forensic snapshot; not a resumable checkpoint. ram.bin contains cloneable readable process RAM. Threads run during capture: title object graphs, allocator metadata, descriptors, command/fence state, save buffers and storage may tear across instants. Non-cloneable/inaccessible mappings, OS handles and GPU-only state are absent. Shared pages may change after cloning. GPU-only writes may be lost. Keep all generations; COMPLETE lists verified files. Saves are a copy of committed on-disk XGameSave state; unsaved progress is not guaranteed.\n")
+-            })?;
+-            if errors.is_empty() {
+-                Ok(())
+-            } else {
+-                Err(std::io::Error::other(errors.join("; ")))
+-            }
+-        })
+-    };
+-    let (code, outcome, folder, detail) = match preserved {
+-        Ok(folder) => (UNSAFE_RESUME, "exit_unsafe_resume", folder, String::new()),
+-        Err(e) => (
+-            PRESERVE_FAILED,
+-            "exit_snapshot_failed",
+-            partial.unwrap_or(root),
+-            e.to_string(),
+-        ),
+-    };
+-    let artifacts = artifacts.join(",");
+-    // CPU bytes alone cannot prove intact state: GPU hand-back may have been
+-    // lost, and OnceLock device children cannot be invalidated/replayed. Zero
+-    // recovery attempts are made for this unsafe state (never a restart loop).
+-    let count = event
+-        .in_flight_commands
+-        .map_or("null".into(), |n| n.to_string());
+-    let timestamp = std::time::SystemTime::now()
+-        .duration_since(std::time::UNIX_EPOCH)
+-        .map_or(0, |d| d.as_millis());
+-    let kind = if event.reason as u32 == 0x887a0007 {
+-        "device_reset"
+-    } else {
+-        "device_removed"
+-    };
+-    let line = format!(
+-        "{{\"timestamp_unix_ms\":{timestamp},\"kind\":\"{kind}\",\"reason\":{},\"in_flight_commands\":{count},\"preserved\":{},\"recovery_attempted\":false,\"attempts\":0,\"attempt_cap\":3,\"outcome\":{},\"folder\":{},\"error\":{},\"dred\":{},\"fault\":{}}}",
+-        event.reason,
+-        json_string(&artifacts),
+-        json_string(outcome),
+-        json_string(&folder.to_string_lossy()),
+-        json_string(&detail),
+-        json_string(&event.dred),
+-        json_string(&event.fault)
+-    );
+-    if let Err(e) = victory_loader::log_crash_event(&line) {
+-        eprintln!("recovery report could not be persisted: {e}");
++    if title.storage.as_os_str().is_empty() {
++        eprintln!("recovery helper cannot start: title storage not configured");
++        super::terminate(PRESERVE_FAILED);
+     }
+-    eprintln!(
+-        "GPU recovery stopped ({outcome}); keep recovery folder: {}",
+-        folder.display()
+-    );
+-    super::terminate(code)
++    // Take this before launch/suspension. If busy, the helper skips save copying.
++    let saves = super::super::xgamesave::recovery_lock();
++    let result = launch(Request {
++        root: title.storage.with_file_name("recovery"),
++        saves: title.saves(),
++        storage: title.storage.clone(),
++        log: victory_loader::crash_log_path()
++            .unwrap_or(std::path::Path::new("crashes.log"))
++            .to_owned(),
++        reason: event.reason,
++        commands: event.in_flight_commands,
++        dred: event.dred.clone(),
++        fault: event.fault.clone(),
++        saves_busy: saves.is_err(),
++    });
++    // Reached only on launch/worker failure. No capture runs on this process.
++    eprintln!("recovery helper failed: {result:?}");
++    super::terminate(PRESERVE_FAILED)
+ }
+ 
+ pub(super) fn ordinary_fault(what: &str) {
+@@ -137,6 +78,7 @@ mod tests {
+     }
+     #[test]
+     fn removal_preserves_and_reports_or_retains_legacy_exit() {
++        victory_loader::recovery::worker::worker();
+         if let Some(root) = std::env::var_os(CHILD) {
+             let root = std::path::PathBuf::from(root);
+             let storage = root.join("storage");
+@@ -170,6 +112,8 @@ mod tests {
+             command
+                 .args(["--exact", TEST, "--nocapture"])
+                 .env(CHILD, root.path())
++                .env("SCARLETT_RECOVERY_TEST_ENTRY", TEST)
++                .env("VICTORY_RECOVERY_BUDGET_MS", "10000")
+                 .env("VICTORY_RECOVER_REMOVAL", if enabled { "1" } else { "0" });
+             if busy {
+                 command.env("VICTORY_0067_BUSY_SAVE", "1");
+diff --git a/crates/victory-hle/src/modules/xgamesave.rs b/crates/victory-hle/src/modules/xgamesave.rs
+index f9619b3..f405a89 100644
+--- a/crates/victory-hle/src/modules/xgamesave.rs
++++ b/crates/victory-hle/src/modules/xgamesave.rs
+@@ -71,11 +71,10 @@ const READABLE: usize = 100;
+ /// Every save operation, so none sees another's half-made version.
+ static SAVES: Mutex<()> = Mutex::new(());
+ 
+-/// Recovery must copy committed versions while no save operation can mutate them.
++/// Held by the reporter until the helper suspends/terminates this process.
+ #[cfg(windows)]
+-pub(crate) fn recovery_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+-    let _saves = SAVES.try_lock().map_err(|_| std::io::Error::other("save operation in progress"))?;
+-    victory_loader::recovery::copy_tree(from, to)
++pub(crate) fn recovery_lock() -> std::io::Result<std::sync::MutexGuard<'static, ()>> {
++    SAVES.try_lock().map_err(|_| std::io::Error::other("save operation in progress"))
+ }
+ 
+ #[cfg(all(windows, test))]
+diff --git a/crates/victory-loader/Cargo.toml b/crates/victory-loader/Cargo.toml
+index d540220..b8f7f5a 100644
+--- a/crates/victory-loader/Cargo.toml
++++ b/crates/victory-loader/Cargo.toml
+@@ -27,6 +27,7 @@ windows-sys = { workspace = true, features = [
+     "Win32_System_Memory",
+     "Win32_System_Performance",
+     "Win32_System_Threading",
++    "Win32_System_SystemInformation",
+ ] }
+ 
+ [dev-dependencies]
+diff --git a/crates/victory-loader/src/crash.rs b/crates/victory-loader/src/crash.rs
+index 0da6a0a..cdb08dc 100644
+--- a/crates/victory-loader/src/crash.rs
++++ b/crates/victory-loader/src/crash.rs
+@@ -70,6 +70,8 @@ pub fn log_crash(text: &str) {
+     append_to_log(&text);
+ }
+ 
++pub fn crash_log_path() -> Option<&'static std::path::Path> { LOG.get().map(|p| p.as_path()) }
++
+ /// One pre-serialized JSON event per physical line, without title-output suffix.
+ /// Errors are returned: preservation must not silently claim a persisted report.
+ pub fn log_crash_event(json: &str) -> std::io::Result<()> {
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+index 80f1764..1e6e209 100644
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -43,7 +43,7 @@ mod windows;
+ 
+ #[cfg(windows)]
+ pub use crash::{
+-    locate, log_crash_event, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
++    locate, crash_log_path, log_crash_event, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+ };
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub use crash::save_on_crash;
+diff --git a/crates/victory-loader/src/recovery.rs b/crates/victory-loader/src/recovery.rs
+index 0231f71..7ec565d 100644
+--- a/crates/victory-loader/src/recovery.rs
++++ b/crates/victory-loader/src/recovery.rs
+@@ -1,43 +1,71 @@
+-//! Immutable forensic recovery generations. These are not executable checkpoints:
+-//! lost GPU writes, OS handles and shared pages cannot be rolled back from RAM.
++//! FORENSIC ONLY. Suspension freezes arbitrary interrupted updates, not a safe point.
++//! No loadable save state, OS handles, non-cloneable pages or GPU state is promised.
+ use std::fs::{self, File, OpenOptions};
+ use std::io::{self, Read, Write};
+ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
+ 
++pub mod worker;
++pub const RAM_HEADER: &[u8] = b"SCARLRAM2FORENSIC_ONLY\n";
++const FORENSIC: &str = "FORENSIC ONLY; never a loadable save state. All title threads are suspended before cloning/copy. Suspension is sequential and can interrupt updates: object graphs, allocator metadata, descriptors, command/fence bookkeeping and save buffers may already be inconsistent. Non-cloneable/inaccessible pages, OS handles and GPU-only state are absent. External processes, kernel I/O and shared mappings may still change. RAM and committed saves are not an atomic checkpoint. COMPLETE contains streaming hashes, not read-back verification. Verify offline before using any artifact. PARTIAL always means incomplete.\n";
+ fn invalid(what: &str) -> io::Error {
+     io::Error::other(what)
+ }
+ 
+-fn hash(file: &Path) -> io::Result<(u64, blake3::Hash)> {
+-    let mut input = File::open(file)?;
+-    let mut hasher = blake3::Hasher::new();
+-    let mut bytes = 0;
+-    let mut buffer = vec![0; 1 << 20];
+-    loop {
+-        let n = input.read(&mut buffer)?;
+-        if n == 0 {
+-            break;
++#[derive(Clone)]
++pub struct Budget {
++    start: Instant,
++    limit: Duration,
++}
++impl Budget {
++    pub fn new(limit: Duration) -> Self {
++        Self {
++            start: Instant::now(),
++            limit,
++        }
++    }
++    pub fn check(&self) -> io::Result<()> {
++        if self.start.elapsed() >= self.limit {
++            Err(io::Error::new(io::ErrorKind::TimedOut, "snapshot deadline"))
++        } else {
++            Ok(())
+         }
+-        hasher.update(&buffer[..n]);
+-        bytes += n as u64;
+     }
+-    Ok((bytes, hasher.finalize()))
++    // Conservative policy estimate, not a throughput claim: 64 MiB/s plus 250 ms.
++    pub fn admit(&self, bytes: u64) -> io::Result<()> {
++        self.check()?;
++        if estimate(bytes) > self.limit.saturating_sub(self.start.elapsed()) {
++            return Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                format!(
++                    "snapshot estimate {} ms for {bytes} bytes exceeds remaining budget",
++                    estimate(bytes).as_millis()
++                ),
++            ));
++        }
++        Ok(())
++    }
++}
++fn estimate(bytes: u64) -> Duration {
++    Duration::from_millis(250u64.saturating_add(bytes.saturating_mul(1000).div_ceil(64 << 20)))
+ }
+ 
+-/// Writes and flushes a new file, then reopens and hashes every byte. Never
+-/// opens an existing destination for truncation, including staging files.
+-pub fn write_verified(
++/// One pass: hash exactly the bytes successfully written. No on-exit readback.
++fn write_hashed(
+     file: &Path,
++    budget: &Budget,
+     write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+-) -> io::Result<u64> {
+-    struct Checked {
++) -> io::Result<(u64, blake3::Hash)> {
++    struct Checked<'a> {
+         file: File,
+         hash: blake3::Hasher,
+         bytes: u64,
++        budget: &'a Budget,
+     }
+-    impl Write for Checked {
++    impl Write for Checked<'_> {
+         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.budget.check()?;
+             let n = self.file.write(bytes)?;
+             self.hash.update(&bytes[..n]);
+             self.bytes += n as u64;
+@@ -47,113 +75,151 @@ pub fn write_verified(
+             self.file.flush()
+         }
+     }
++    budget.check()?;
+     let mut out = Checked {
+         file: OpenOptions::new().write(true).create_new(true).open(file)?,
+         hash: blake3::Hasher::new(),
+         bytes: 0,
++        budget,
+     };
+     write(&mut out)?;
++    budget.check()?;
+     out.file.sync_all()?;
+-    let expected = (out.bytes, out.hash.finalize());
+-    drop(out);
+-    if hash(file)? != expected {
+-        return Err(invalid("snapshot read-back mismatch"));
+-    }
+-    Ok(expected.0)
++    budget.check()?;
++    Ok((out.bytes, out.hash.finalize()))
+ }
+ 
+-/// Copy while the caller holds the title's save-operation lock. Links and
+-/// junctions are rejected; they could escape the selected state directory.
+-pub fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+-    use std::os::windows::fs::MetadataExt;
+-    let metadata = match fs::symlink_metadata(source) {
+-        Ok(m) => m,
+-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+-            fs::create_dir(destination)?;
+-            return Ok(());
++pub struct Generation {
++    pub path: PathBuf,
++    budget: Budget,
++    manifest: String,
++}
++impl Generation {
++    /// Persist PARTIAL before any target thread is suspended or data copied.
++    pub fn begin(root: &Path, budget: Budget) -> io::Result<Self> {
++        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
++        fs::create_dir_all(root)?;
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map_err(io::Error::other)?
++            .as_nanos();
++        let path = root.join(format!(
++            "snapshot-{now}-{}-{}.partial",
++            std::process::id(),
++            SEQUENCE.fetch_add(1, Ordering::Relaxed)
++        ));
++        fs::create_dir(&path)?;
++        let mut marker = OpenOptions::new()
++            .create_new(true)
++            .write(true)
++            .open(path.join("PARTIAL"))?;
++        marker.write_all(b"FORENSIC_ONLY: capture incomplete; reject even if COMPLETE exists\n")?;
++        marker.sync_all()?;
++        let mut readme = OpenOptions::new()
++            .create_new(true)
++            .write(true)
++            .open(path.join("README.txt"))?;
++        readme.write_all(FORENSIC.as_bytes())?;
++        readme.sync_all()?;
++        let manifest = format!(
++            "SCARLETT_FORENSIC_MANIFEST_2\n{} {} \"README.txt\"\n",
++            blake3::hash(FORENSIC.as_bytes()),
++            FORENSIC.len()
++        );
++        Ok(Self {
++            path,
++            budget,
++            manifest,
++        })
++    }
++    pub fn write(
++        &mut self,
++        name: &Path,
++        write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
++    ) -> io::Result<u64> {
++        if name.is_absolute()
++            || name
++                .components()
++                .any(|c| !matches!(c, std::path::Component::Normal(_)))
++        {
++            return Err(invalid("invalid artifact path"));
+         }
+-        Err(e) => return Err(e),
+-    };
+-    if metadata.file_attributes() & 0x400 != 0 {
+-        return Err(invalid("state contains a reparse point"));
++        let (bytes, digest) = write_hashed(&self.path.join(name), &self.budget, write)?;
++        self.manifest
++            .push_str(&format!("{digest} {bytes} {:?}\n", name));
++        Ok(bytes)
+     }
+-    fs::create_dir(destination)?;
+-    for entry in fs::read_dir(source)? {
+-        let entry = entry?;
+-        let metadata = fs::symlink_metadata(entry.path())?;
++    pub fn copy_tree(&mut self, source: &Path, name: &Path) -> io::Result<()> {
++        use std::os::windows::fs::MetadataExt;
++        self.budget.check()?;
++        let metadata = match fs::symlink_metadata(source) {
++            Ok(m) => m,
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {
++                fs::create_dir(self.path.join(name))?;
++                return Ok(());
++            }
++            Err(e) => return Err(e),
++        };
+         if metadata.file_attributes() & 0x400 != 0 {
+             return Err(invalid("state contains a reparse point"));
+         }
+-        let to = destination.join(entry.file_name());
+-        if metadata.is_dir() {
+-            copy_tree(&entry.path(), &to)?;
+-        } else if metadata.is_file() {
+-            let mut input = File::open(entry.path())?;
+-            write_verified(&to, |out| {
+-                io::copy(&mut input, out)?;
+-                Ok(())
+-            })?;
+-        } else {
+-            return Err(invalid("state contains a non-file"));
+-        }
+-    }
+-    Ok(())
+-}
+-
+-/// Publish only after every artifact is verified. A failed generation remains
+-/// visibly .partial; previous published generations are never renamed/deleted.
+-pub fn publish(root: &Path, write: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
+-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+-    fs::create_dir_all(root)?;
+-    let now = std::time::SystemTime::now()
+-        .duration_since(std::time::UNIX_EPOCH)
+-        .map_err(|_| invalid("clock before epoch"))?
+-        .as_nanos();
+-    let name = format!(
+-        "snapshot-{now}-{}-{}",
+-        std::process::id(),
+-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+-    );
+-    let partial = root.join(format!("{name}.partial"));
+-    let complete = root.join(name);
+-    fs::create_dir(&partial)?;
+-    write(&partial)?;
+-    // A manifest authenticates all files before the commit rename. Rehash the
+-    // actual tree again after writing it, so unreadable/corrupt output is rejected.
+-    fn inventory(root: &Path, at: &Path, out: &mut String) -> io::Result<()> {
+-        let mut entries = fs::read_dir(at)?.collect::<io::Result<Vec<_>>>()?;
+-        entries.sort_by_key(|e| e.file_name());
+-        for entry in entries {
+-            let path = entry.path();
+-            if entry.file_type()?.is_dir() {
+-                inventory(root, &path, out)?;
+-            } else if entry.file_type()?.is_file() {
+-                let (bytes, digest) = hash(&path)?;
+-                out.push_str(&format!(
+-                    "{digest} {bytes} {:?}\n",
+-                    path.strip_prefix(root).map_err(io::Error::other)?
+-                ));
++        fs::create_dir(self.path.join(name))?;
++        for entry in fs::read_dir(source)? {
++            self.budget.check()?;
++            let entry = entry?;
++            let metadata = fs::symlink_metadata(entry.path())?;
++            if metadata.file_attributes() & 0x400 != 0 {
++                return Err(invalid("state contains a reparse point"));
++            }
++            let to = name.join(entry.file_name());
++            if metadata.is_dir() {
++                self.copy_tree(&entry.path(), &to)?;
++            } else if metadata.is_file() {
++                let mut input = File::open(entry.path())?;
++                self.write(&to, |out| {
++                    let mut buffer = vec![0; 1 << 20];
++                    loop {
++                        let n = input.read(&mut buffer)?;
++                        if n == 0 {
++                            break;
++                        }
++                        out.write_all(&buffer[..n])?;
++                    }
++                    Ok(())
++                })?;
+             } else {
+-                return Err(invalid("snapshot contains a link"));
++                return Err(invalid("state contains a non-file"));
+             }
+         }
+         Ok(())
+     }
+-    let mut before = String::new();
+-    inventory(&partial, &partial, &mut before)?;
+-    if before.is_empty() {
+-        return Err(invalid("empty recovery snapshot"));
++    pub fn ram(&mut self, process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<u64> {
++        let budget = self.budget.clone();
++        self.write(Path::new("ram.bin"), |out| {
++            capture_process_ram(process, out, &budget)
++        })
+     }
+-    let mut again = String::new();
+-    inventory(&partial, &partial, &mut again)?;
+-    if before != again {
+-        return Err(invalid("snapshot changed during verification"));
++    /// Manifest is last. PARTIAL takes precedence through every interrupted phase.
++    pub fn finish(self) -> io::Result<PathBuf> {
++        write_hashed(&self.path.join("COMPLETE"), &self.budget, |out| {
++            out.write_all(self.manifest.as_bytes())
++        })?;
++        self.budget.check()?;
++        // Rename while PARTIAL still exists: even an interrupted rename is rejected.
++        let complete = self.path.with_extension("");
++        fs::rename(&self.path, &complete)?;
++        self.budget.check()?;
++        fs::remove_file(complete.join("PARTIAL"))?;
++        Ok(complete)
+     }
+-    write_verified(&partial.join("COMPLETE"), |out| {
+-        out.write_all(before.as_bytes())
+-    })?;
+-    fs::rename(&partial, &complete)?;
+-    Ok(complete)
++}
++
++/// A loader must reject PARTIAL before consulting COMPLETE. Hash verification is
++/// an offline operation; this predicate only tests publication, never loadability.
++pub fn is_complete(path: &Path) -> bool {
++    path.extension().is_none_or(|e| e != "partial")
++        && !path.join("PARTIAL").exists()
++        && path.join("COMPLETE").is_file()
+ }
+ 
+ /// Captures cloneable private/image/section RAM before teardown. The archive is
+@@ -161,7 +227,11 @@ pub fn publish(root: &Path, write: impl FnOnce(&Path) -> io::Result<()>) -> io::
+ /// bytes[length]), then an all-zero record. Inaccessible/uncommitted ranges
+ /// are excluded; guard protection is removed only in the clone. Read failures abort publication rather than claiming completeness.
+ /// Shareable sections may change while copied: forensic data, never a safe point.
+-pub fn capture_ram(file: &Path) -> io::Result<u64> {
++fn capture_process_ram(
++    process: windows_sys::Win32::Foundation::HANDLE,
++    out: &mut dyn Write,
++    budget: &Budget,
++) -> io::Result<()> {
+     use windows_sys::Win32::System::{
+         Diagnostics::{Debug::ReadProcessMemory, ProcessSnapshotting::*},
+         Memory::*,
+@@ -180,7 +250,7 @@ pub fn capture_ram(file: &Path) -> io::Result<u64> {
+     // SAFETY: snapshot output is valid; no title code or DbgHelp is called.
+     let error = unsafe {
+         PssCaptureSnapshot(
+-            GetCurrentProcess(),
++            process,
+             PSS_CAPTURE_VA_CLONE | PSS_CREATE_USE_VM_ALLOCATIONS,
+             0,
+             &mut snapshot,
+@@ -203,11 +273,12 @@ pub fn capture_ram(file: &Path) -> io::Result<u64> {
+     if error != 0 {
+         return Err(io::Error::from_raw_os_error(error as i32));
+     }
+-    write_verified(file, |out| {
+-        out.write_all(b"SCARLRAM2FORENSIC_ONLY\n")?;
++    {
++        out.write_all(RAM_HEADER)?;
+         let mut at = 0usize;
+         let mut buffer = vec![0; 1 << 20];
+         loop {
++            budget.check()?;
+             let mut region = MEMORY_BASIC_INFORMATION::default();
+             // SAFETY: query does not dereference the target address in this process.
+             if unsafe {
+@@ -260,6 +331,7 @@ pub fn capture_ram(file: &Path) -> io::Result<u64> {
+                 out.write_all(&region.Type.to_le_bytes())?;
+                 let mut cursor = base;
+                 while cursor < end {
++                    budget.check()?;
+                     let n = buffer.len().min(end - cursor);
+                     let mut read = 0;
+                     // SAFETY: OS validates clone memory; output is n writable bytes.
+@@ -283,7 +355,7 @@ pub fn capture_ram(file: &Path) -> io::Result<u64> {
+             at = end;
+         }
+         out.write_all(&[0; 24])
+-    })
++    }
+ }
+ 
+ /// JSON string escaping without adding a serialization dependency to the loader.
+@@ -308,49 +380,67 @@ pub fn json_string(text: &str) -> String {
+ mod tests {
+     use super::*;
+     #[test]
+-    fn a_failed_generation_cannot_replace_a_good_one() {
++    fn partial_precedes_manifest_and_failed_write_keeps_old_generation() {
+         let root = tempfile::tempdir().unwrap();
+-        let good = publish(root.path(), |at| {
+-            write_verified(&at.join("ram"), |w| w.write_all(b"old RAM"))?;
+-            Ok(())
+-        })
+-        .unwrap();
+-        let complete = fs::read(good.join("COMPLETE")).unwrap();
+-        let result = publish(root.path(), |at| {
+-            write_verified(&at.join("ram"), |w| {
+-                w.write_all(b"partial")?;
+-                Err(invalid("disk full"))
+-            })?;
+-            Ok(())
+-        });
+-        assert!(result.is_err());
++        let mut good = Generation::begin(root.path(), Budget::new(Duration::from_secs(5))).unwrap();
++        good.write(Path::new("ram"), |w| w.write_all(b"old RAM"))
++            .unwrap();
++        let good = good.finish().unwrap();
++        let manifest = fs::read(good.join("COMPLETE")).unwrap();
++        assert!(is_complete(&good));
++        let mut failed =
++            Generation::begin(root.path(), Budget::new(Duration::from_secs(5))).unwrap();
++        assert!(
++            failed
++                .write(Path::new("ram"), |w| {
++                    w.write_all(b"partial")?;
++                    Err(invalid("disk full"))
++                })
++                .is_err()
++        );
++        fs::write(failed.path.join("COMPLETE"), b"misleading manifest").unwrap();
++        assert!(!is_complete(&failed.path));
+         assert_eq!(fs::read(good.join("ram")).unwrap(), b"old RAM");
+-        assert_eq!(fs::read(good.join("COMPLETE")).unwrap(), complete);
+-        assert_eq!(
+-            fs::read_dir(root.path())
++        assert_eq!(fs::read(good.join("COMPLETE")).unwrap(), manifest);
++        assert!(failed.path.join("PARTIAL").exists());
++    }
++    #[test]
++    fn streaming_manifest_matches_independent_offline_hash() {
++        let root = tempfile::tempdir().unwrap();
++        let mut generation =
++            Generation::begin(root.path(), Budget::new(Duration::from_secs(5))).unwrap();
++        generation
++            .write(Path::new("data"), |out| {
++                out.write_all(b"one")?;
++                out.write_all(b"two")
++            })
++            .unwrap();
++        let complete = generation.finish().unwrap();
++        let bytes = fs::read(complete.join("data")).unwrap();
++        assert!(
++            fs::read_to_string(complete.join("COMPLETE"))
+                 .unwrap()
+-                .filter(|e| !e
+-                    .as_ref()
+-                    .unwrap()
+-                    .file_name()
+-                    .to_string_lossy()
+-                    .ends_with(".partial"))
+-                .count(),
+-            1
++                .contains(&format!("{} 6 \"data\"", blake3::hash(&bytes)))
+         );
+-        assert!(write_verified(&good.join("ram"), |_| Ok(())).is_err());
++        assert_eq!(json_string("a\n\"\\\0"), "\"a\\n\\\"\\\\\\u0000\"");
+     }
+     #[test]
+-    fn copied_save_state_is_independent_and_verified() {
++    fn size_estimate_and_expired_budget_reject_work() {
++        assert_eq!(estimate(64 << 20), Duration::from_millis(1250));
++        assert!(
++            Budget::new(Duration::from_millis(100))
++                .admit(64 << 20)
++                .is_err()
++        );
+         let root = tempfile::tempdir().unwrap();
+-        let source = root.path().join("saves");
+-        fs::create_dir(&source).unwrap();
+-        fs::write(source.join("blob"), b"saved").unwrap();
+-        let copy = root.path().join("copy");
+-        copy_tree(&source, &copy).unwrap();
+-        fs::write(source.join("blob"), b"next").unwrap();
+-        assert_eq!(fs::read(copy.join("blob")).unwrap(), b"saved");
+-        assert_eq!(json_string("a\n\"\\\0"), "\"a\\n\\\"\\\\\\u0000\"");
++        let mut generation = Generation::begin(root.path(), Budget::new(Duration::ZERO)).unwrap();
++        assert!(
++            generation
++                .write(Path::new("data"), |w| w.write_all(b"no"))
++                .is_err()
++        );
++        assert!(generation.path.join("PARTIAL").exists());
++        assert!(!is_complete(&generation.path));
+     }
+     #[test]
+     fn clone_archive_is_readable() {
+@@ -383,11 +473,16 @@ mod tests {
+             0
+         );
+         let root = tempfile::tempdir().unwrap();
+-        let file = root.path().join("ram.bin");
++
+         let start = std::time::Instant::now();
+-        let bytes = capture_ram(&file).unwrap();
++        let mut generation =
++            Generation::begin(root.path(), Budget::new(Duration::from_secs(10))).unwrap();
++        let bytes = generation
++            .ram(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
++            .unwrap();
++        let file = generation.path.join("ram.bin");
+         eprintln!(
+-            "PSS archive: {bytes} bytes verified in {:?}",
++            "PSS archive: {bytes} bytes streamed in {:?}",
+             start.elapsed()
+         );
+         assert!(bytes > 4096);
+diff --git a/crates/victory-loader/src/recovery/worker.rs b/crates/victory-loader/src/recovery/worker.rs
+new file mode 100644
+index 0000000..d24d2db
+--- /dev/null
++++ b/crates/victory-loader/src/recovery/worker.rs
+@@ -0,0 +1,630 @@
++//! Out-of-process capture: target locks and heap state are never used after suspension.
++use super::*;
++use std::process::Command;
++use windows_sys::Win32::{
++    Foundation::*,
++    System::{Diagnostics::ToolHelp::*, Memory::*, Threading::*},
++};
++
++pub const DEADLINE_EXIT: u32 = 0xe0680002;
++const INCOMPLETE_EXIT: u32 = 0xe0670002;
++const COMPLETE_EXIT: u32 = 0xe0670001;
++const CHILD: &str = "SCARLETT_RECOVERY_WORKER";
++
++pub struct Request {
++    pub root: PathBuf,
++    pub saves: PathBuf,
++    pub storage: PathBuf,
++    pub log: PathBuf,
++    pub reason: i32,
++    pub commands: Option<u64>,
++    pub dred: String,
++    pub fault: String,
++    pub saves_busy: bool,
++}
++
++/// Invoked only after removal. Caller holds the save lock (or records busy),
++/// launches before suspension, then performs no more capture work in the title.
++/// Returns only on launch failure; successful helper owns target termination.
++pub fn launch(request: Request) -> io::Result<()> {
++    let millis = std::env::var("VICTORY_RECOVERY_BUDGET_MS")
++        .ok()
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(2000)
++        .clamp(50, 10_000);
++    let deadline = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
++        .saturating_add(millis);
++    // Independent fallback covers a blocked CreateProcess or helper startup.
++    // Once suspended, the helper's own watchdog replaces this one.
++    let (tx, rx) = std::sync::mpsc::sync_channel(0);
++    std::thread::Builder::new()
++        .name("recovery-start-deadline".into())
++        .spawn(move || {
++            let _ = tx.send(unsafe { GetCurrentThreadId() });
++            unsafe {
++                Sleep(millis as u32);
++            }
++            unsafe {
++                TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
++            }
++        })?;
++    let watchdog_tid = rx
++        .recv_timeout(Duration::from_millis(millis))
++        .unwrap_or_else(|_| {
++            unsafe {
++                TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
++            }
++            std::process::abort()
++        });
++    let parent_created = process_created(unsafe { GetCurrentProcess() })?;
++    let mut command = Command::new(std::env::current_exe()?);
++    // Test binaries reenter their selected fixture; production checks worker()
++    // before CLI parsing. No shell, no title data, no extra shipped executable.
++
++    command
++        .env(CHILD, std::process::id().to_string())
++        .env(
++            "SCARLETT_RECOVERY_PARENT_CREATED",
++            parent_created.to_string(),
++        )
++        .env("SCARLETT_RECOVERY_WATCHDOG_TID", watchdog_tid.to_string())
++        .env("SCARLETT_RECOVERY_ROOT", request.root)
++        .env("SCARLETT_RECOVERY_SAVES", request.saves)
++        .env("SCARLETT_RECOVERY_STORAGE", request.storage)
++        .env("SCARLETT_RECOVERY_LOG", request.log)
++        .env("SCARLETT_RECOVERY_DEADLINE", deadline.to_string())
++        .env("SCARLETT_RECOVERY_REASON", request.reason.to_string())
++        .env(
++            "SCARLETT_RECOVERY_COMMANDS",
++            request.commands.map_or(String::new(), |n| n.to_string()),
++        )
++        .env("SCARLETT_RECOVERY_DRED", request.dred)
++        .env("SCARLETT_RECOVERY_FAULT", request.fault)
++        .env(
++            "SCARLETT_RECOVERY_SAVES_BUSY",
++            if request.saves_busy { "1" } else { "0" },
++        );
++    // HLE test executable is not compiled with loader's cfg(test).
++    if let Some(test) = std::env::var_os("SCARLETT_RECOVERY_TEST_ENTRY") {
++        command.arg("--exact").arg(test).arg("--nocapture");
++    } else if cfg!(test) {
++        command.args(std::env::args_os().skip(1));
++    }
++    let mut child = command.spawn()?;
++    let status = child.wait()?;
++    Err(invalid(&format!(
++        "recovery worker ended before terminating target: {status}"
++    )))
++}
++
++fn env(name: &str) -> io::Result<std::ffi::OsString> {
++    std::env::var_os(name).ok_or_else(|| invalid("missing recovery worker field"))
++}
++fn number<T: std::str::FromStr>(name: &str) -> io::Result<T> {
++    env(name)?
++        .to_str()
++        .ok_or_else(|| invalid("invalid worker number"))?
++        .parse()
++        .map_err(|_| invalid("invalid worker number"))
++}
++fn path(name: &str) -> io::Result<PathBuf> {
++    Ok(PathBuf::from(env(name)?))
++}
++fn process_created(process: HANDLE) -> io::Result<u64> {
++    let mut created = FILETIME::default();
++    let mut exited = FILETIME::default();
++    let mut kernel = FILETIME::default();
++    let mut user = FILETIME::default();
++    if unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
++}
++fn parent_is(pid: u32) -> bool {
++    // Prevent an inherited/stale worker variable from targeting an unrelated pid.
++    unsafe {
++        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++        if snapshot == INVALID_HANDLE_VALUE {
++            return false;
++        }
++        let mut entry = PROCESSENTRY32W {
++            dwSize: size_of::<PROCESSENTRY32W>() as u32,
++            ..std::mem::zeroed()
++        };
++        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
++        let mut found = false;
++        while more {
++            if entry.th32ProcessID == GetCurrentProcessId() {
++                found = entry.th32ParentProcessID == pid;
++                break;
++            }
++            more = Process32NextW(snapshot, &mut entry) != 0;
++        }
++        CloseHandle(snapshot);
++        found
++    }
++}
++
++/// Call before tracing/CLI startup. Never returns in a worker. Test children
++/// invoke the very same function before their fixture body.
++pub fn worker() {
++    let Ok(pid) = number::<u32>(CHILD) else {
++        return;
++    };
++    if !parent_is(pid) {
++        std::process::exit(2);
++    }
++    let target = unsafe {
++        OpenProcess(
++            PROCESS_QUERY_INFORMATION
++                | PROCESS_VM_READ
++                | PROCESS_VM_OPERATION
++                | PROCESS_DUP_HANDLE
++                | PROCESS_CREATE_PROCESS
++                | PROCESS_TERMINATE,
++            0,
++            pid,
++        )
++    };
++    if target.is_null() {
++        std::process::exit(2);
++    }
++    if process_created(target).ok() != number::<u64>("SCARLETT_RECOVERY_PARENT_CREATED").ok() {
++        std::process::exit(2);
++    }
++    let deadline = number::<u64>("SCARLETT_RECOVERY_DEADLINE").unwrap_or(0);
++    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
++    let remaining = Duration::from_millis(deadline.saturating_sub(now));
++    #[cfg(test)]
++    fs::write(
++        root_for_test().join("worker.pid"),
++        std::process::id().to_string(),
++    )
++    .unwrap();
++    let raw = target as usize;
++    // No heap, filesystem, CRT exit or target locks once this deadline fires.
++    let watchdog = std::thread::Builder::new()
++        .name("capture-hard-deadline".into())
++        .spawn(move || {
++            std::thread::sleep(remaining);
++            unsafe {
++                TerminateProcess(raw as HANDLE, DEADLINE_EXIT);
++                TerminateProcess(GetCurrentProcess(), DEADLINE_EXIT);
++            }
++        });
++    if watchdog.is_err() {
++        unsafe {
++            TerminateProcess(target, INCOMPLETE_EXIT);
++        }
++        std::process::exit(2);
++    }
++    let budget = Budget::new(remaining);
++    let root = path("SCARLETT_RECOVERY_ROOT").unwrap_or_default();
++    let mut folder = root.clone();
++    let mut artifacts = Vec::new();
++    let result = (|| -> io::Result<PathBuf> {
++        let mut generation = Generation::begin(&root, budget.clone())?;
++        folder = generation.path.clone();
++        suspend_target(pid, number("SCARLETT_RECOVERY_WATCHDOG_TID")?, &budget)?;
++        #[cfg(test)]
++        exercise_test_faults(target, &mut generation)?;
++        // All title threads stay stopped until exit. Only the neutral parent
++        // watchdog remains runnable, so helper death cannot strand the target.
++        let ram_bytes = readable_bytes(target, &budget)?;
++        let saves = path("SCARLETT_RECOVERY_SAVES")?;
++        let storage = path("SCARLETT_RECOVERY_STORAGE")?;
++        let size = ram_bytes
++            .saturating_add(tree_bytes(&saves, &budget)?)
++            .saturating_add(tree_bytes(&storage, &budget)?);
++        generation.write(Path::new("estimate.txt"), |out| {
++            writeln!(
++                out,
++                "bytes={size} policy_ms={} budget_ms={}",
++                estimate(size).as_millis(),
++                remaining.as_millis()
++            )
++        })?;
++        budget.admit(size)?;
++        let mut errors = Vec::new();
++        let mut timed_out = false;
++        let mut record = |name, result: io::Result<()>| match result {
++            Ok(()) => artifacts.push(name),
++            Err(e) => {
++                timed_out |= e.kind() == io::ErrorKind::TimedOut;
++                errors.push(format!("{name}: {e}"));
++            }
++        };
++        record(
++            "dred",
++            generation
++                .write(Path::new("dred.txt"), |out| {
++                    out.write_all(env("SCARLETT_RECOVERY_DRED")?.to_string_lossy().as_bytes())?;
++                    out.write_all(env("SCARLETT_RECOVERY_FAULT")?.to_string_lossy().as_bytes())
++                })
++                .map(|_| ()),
++        );
++        record("ram", generation.ram(target).map(|_| ()));
++        record(
++            "saves",
++            if env("SCARLETT_RECOVERY_SAVES_BUSY")? == "1" {
++                Err(invalid("save operation in progress"))
++            } else {
++                generation.copy_tree(&saves, Path::new("saves"))
++            },
++        );
++        record(
++            "storage",
++            generation.copy_tree(&storage, Path::new("storage")),
++        );
++        if !errors.is_empty() {
++            return Err(io::Error::new(
++                if timed_out {
++                    io::ErrorKind::TimedOut
++                } else {
++                    io::ErrorKind::Other
++                },
++                errors.join("; "),
++            ));
++        }
++        generation.finish()
++    })();
++    let (code, outcome, error) = match result {
++        Ok(path) => {
++            folder = path;
++            (COMPLETE_EXIT, "exit_unsafe_resume", String::new())
++        }
++        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
++            (DEADLINE_EXIT, "exit_snapshot_budget", e.to_string())
++        }
++        Err(e) => (INCOMPLETE_EXIT, "exit_snapshot_failed", e.to_string()),
++    };
++    // Only helper-owned std/OS locks are used; no title logging mutex is touched.
++    if !folder.exists() && folder.with_extension("").exists() {
++        folder = folder.with_extension("");
++    }
++    let report = (|| -> io::Result<()> {
++        let reason = number::<i32>("SCARLETT_RECOVERY_REASON")?;
++        let timestamp = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_millis();
++        let commands =
++            number::<u64>("SCARLETT_RECOVERY_COMMANDS").map_or("null".into(), |n| n.to_string());
++        let line = format!(
++            "{{\"timestamp_unix_ms\":{timestamp},\"kind\":\"{}\",\"reason\":{reason},\"in_flight_commands\":{commands},\"preserved\":{},\"recovery_attempted\":false,\"attempts\":0,\"attempt_cap\":3,\"outcome\":{},\"folder\":{},\"error\":{},\"dred\":{},\"fault\":{}}}\n",
++            if reason as u32 == 0x887a0007 {
++                "device_reset"
++            } else {
++                "device_removed"
++            },
++            json_string(&artifacts.join(",")),
++            json_string(outcome),
++            json_string(&folder.to_string_lossy()),
++            json_string(&error),
++            json_string(&env("SCARLETT_RECOVERY_DRED")?.to_string_lossy()),
++            json_string(&env("SCARLETT_RECOVERY_FAULT")?.to_string_lossy())
++        );
++        let mut log = OpenOptions::new()
++            .append(true)
++            .create(true)
++            .open(path("SCARLETT_RECOVERY_LOG")?)?;
++        log.write_all(line.as_bytes())?;
++        log.sync_all()
++    })();
++    if let Err(e) = report {
++        eprintln!("recovery report could not be persisted: {e}");
++    }
++    eprintln!(
++        "GPU recovery stopped ({outcome}); keep recovery folder: {}",
++        folder.display()
++    );
++    unsafe {
++        TerminateProcess(target, code);
++        TerminateProcess(GetCurrentProcess(), 0);
++    }
++    std::process::abort();
++}
++
++fn suspend_target(pid: u32, watchdog_tid: u32, budget: &Budget) -> io::Result<()> {
++    // Keep handles open to pin thread identities against tid reuse. No resume:
++    // target termination follows capture or any error/deadline.
++    let mut suspended = std::collections::HashMap::new();
++    let mut stable = 0;
++    while stable < 2 {
++        budget.check()?;
++        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
++        if snapshot == INVALID_HANDLE_VALUE {
++            return Err(io::Error::last_os_error());
++        }
++        let mut entry = THREADENTRY32 {
++            dwSize: size_of::<THREADENTRY32>() as u32,
++            ..unsafe { std::mem::zeroed() }
++        };
++        let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
++        let mut added = false;
++        while more {
++            if entry.th32OwnerProcessID == pid
++                && entry.th32ThreadID != watchdog_tid
++                && !suspended.contains_key(&entry.th32ThreadID)
++            {
++                let thread = unsafe {
++                    OpenThread(
++                        THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
++                        0,
++                        entry.th32ThreadID,
++                    )
++                };
++                if thread.is_null() {
++                    unsafe {
++                        CloseHandle(snapshot);
++                    }
++                    return Err(io::Error::last_os_error());
++                }
++                let owner = unsafe { GetProcessIdOfThread(thread) };
++                if owner != pid || unsafe { SuspendThread(thread) } == u32::MAX {
++                    unsafe {
++                        CloseHandle(thread);
++                        CloseHandle(snapshot);
++                    }
++                    return Err(invalid("target thread suspension failed"));
++                }
++                suspended.insert(entry.th32ThreadID, thread);
++                added = true;
++            }
++            more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
++        }
++        let error = io::Error::last_os_error();
++        unsafe {
++            CloseHandle(snapshot);
++        }
++        if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
++            return Err(error);
++        }
++        if added {
++            stable = 0;
++        } else {
++            stable += 1;
++        }
++    }
++    // Handle closure does not resume threads.
++    for (_, thread) in suspended {
++        unsafe {
++            CloseHandle(thread);
++        }
++    }
++    Ok(())
++}
++
++fn readable_bytes(process: HANDLE, budget: &Budget) -> io::Result<u64> {
++    let mut at = 0usize;
++    let mut bytes = 0u64;
++    loop {
++        budget.check()?;
++        let mut region = MEMORY_BASIC_INFORMATION::default();
++        if unsafe { VirtualQueryEx(process, at as *const _, &mut region, size_of_val(&region)) }
++            == 0
++        {
++            let error = io::Error::last_os_error();
++            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
++                return Ok(bytes);
++            }
++            return Err(error);
++        }
++        if region.State == MEM_COMMIT
++            && region.Protect != 0
++            && region.Protect & PAGE_NOACCESS == 0
++            && region.Protect & 0xff != PAGE_EXECUTE
++        {
++            bytes = bytes.saturating_add(region.RegionSize as u64);
++        }
++        at = (region.BaseAddress as usize)
++            .checked_add(region.RegionSize)
++            .filter(|n| *n > at)
++            .ok_or_else(|| invalid("invalid region"))?;
++    }
++}
++fn tree_bytes(at: &Path, budget: &Budget) -> io::Result<u64> {
++    use std::os::windows::fs::MetadataExt;
++    budget.check()?;
++    let meta = match fs::symlink_metadata(at) {
++        Ok(m) => m,
++        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
++        Err(e) => return Err(e),
++    };
++    if meta.file_attributes() & 0x400 != 0 {
++        return Err(invalid("state contains a reparse point"));
++    }
++    if meta.is_file() {
++        return Ok(meta.len());
++    }
++    let mut bytes = 0u64;
++    for entry in fs::read_dir(at)? {
++        bytes = bytes.saturating_add(tree_bytes(&entry?.path(), budget)?);
++    }
++    Ok(bytes)
++}
++
++#[cfg(test)]
++fn root_for_test() -> PathBuf {
++    path("SCARLETT_0068_FIXTURE").unwrap_or_else(|_| std::env::temp_dir())
++}
++#[cfg(test)]
++fn exercise_test_faults(target: HANDLE, generation: &mut Generation) -> io::Result<()> {
++    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
++    if let Ok(address) = number::<usize>("SCARLETT_0068_COUNTER") {
++        let read = || -> io::Result<u64> {
++            let mut value = 0u64;
++            let mut count = 0;
++            if unsafe {
++                ReadProcessMemory(
++                    target,
++                    address as *const _,
++                    (&raw mut value).cast(),
++                    8,
++                    &mut count,
++                )
++            } == 0
++                || count != 8
++            {
++                return Err(io::Error::last_os_error());
++            }
++            Ok(value)
++        };
++        let before = read()?;
++        unsafe {
++            Sleep(30);
++        }
++        let after = read()?;
++        if before != after {
++            return Err(invalid("title mutator still executing during capture"));
++        }
++        generation.write(Path::new("quiescence.txt"), |out| {
++            writeln!(out, "mutator={before},{after}")
++        })?;
++    }
++    match std::env::var("SCARLETT_0068_MODE")
++        .unwrap_or_default()
++        .as_str()
++    {
++        "stall" => unsafe {
++            Sleep(30_000);
++        },
++        "helper_death" => unsafe {
++            TerminateProcess(GetCurrentProcess(), 99);
++        },
++        _ => {}
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    const TEST: &str = "recovery::worker::tests::suspended_capture_and_hard_deadlines";
++    #[test]
++    fn suspended_capture_and_hard_deadlines() {
++        worker();
++        if let Some(root) = std::env::var_os("SCARLETT_0068_FIXTURE") {
++            let root = PathBuf::from(root);
++            let mode = std::env::var("SCARLETT_0068_MODE").unwrap();
++            let storage = root.join("storage");
++            fs::create_dir(&storage).unwrap();
++            let saves = root.join("saves");
++            fs::create_dir(&saves).unwrap();
++            fs::write(saves.join("save"), b"committed").unwrap();
++            let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
++            let address = std::sync::Arc::as_ptr(&counter) as usize;
++            let active = counter.clone();
++            let _mutator = std::thread::spawn(move || {
++                loop {
++                    active.fetch_add(1, Ordering::Relaxed);
++                    std::thread::yield_now();
++                }
++            });
++            while counter.load(Ordering::Relaxed) < 100 {
++                std::thread::yield_now();
++            }
++            let large = if mode == "size" {
++                vec![0x68u8; 128 << 20]
++            } else {
++                Vec::new()
++            };
++            std::hint::black_box(&large);
++            unsafe {
++                std::env::set_var("SCARLETT_0068_COUNTER", address.to_string());
++            }
++            launch(Request {
++                root: root.join("recovery"),
++                saves,
++                storage,
++                log: root.join("crashes.log"),
++                reason: 0x887a0005u32 as i32,
++                commands: None,
++                dred: String::new(),
++                fault: "synthetic no-title removal".into(),
++                saves_busy: false,
++            })
++            .unwrap();
++            panic!("helper failed to terminate target");
++        }
++        for (mode, millis, code) in [
++            ("success", 10000, COMPLETE_EXIT),
++            ("size", 1000, DEADLINE_EXIT),
++            ("stall", 1000, DEADLINE_EXIT),
++            ("helper_death", 1000, DEADLINE_EXIT),
++        ] {
++            let root = tempfile::tempdir().unwrap();
++            let mut child = Command::new(std::env::current_exe().unwrap())
++                .args(["--exact", TEST, "--nocapture"])
++                .env("SCARLETT_0068_FIXTURE", root.path())
++                .env("SCARLETT_0068_MODE", mode)
++                .env("SCARLETT_RECOVERY_TEST_ENTRY", TEST)
++                .env("VICTORY_RECOVERY_BUDGET_MS", millis.to_string())
++                .env_remove(CHILD)
++                .spawn()
++                .unwrap();
++            let started = Instant::now();
++            let status = loop {
++                match child.try_wait().unwrap() {
++                    Some(status) => break status,
++                    None if started.elapsed() < Duration::from_secs(15) => {
++                        std::thread::sleep(Duration::from_millis(10))
++                    }
++                    None => {
++                        let _ = child.kill();
++                        let _ = child.wait();
++                        panic!("worker/target hung in mode {mode}");
++                    }
++                }
++            };
++            assert_eq!(status.code().unwrap() as u32, code, "mode={mode}");
++            let folder = fs::read_dir(root.path().join("recovery"))
++                .unwrap()
++                .next()
++                .unwrap()
++                .unwrap()
++                .path();
++            if mode == "success" {
++                assert!(is_complete(&folder));
++                assert!(
++                    fs::read_to_string(folder.join("quiescence.txt"))
++                        .unwrap()
++                        .starts_with("mutator=")
++                );
++            } else {
++                assert!(!is_complete(&folder));
++                assert!(folder.join("PARTIAL").exists());
++                assert!(!folder.join("COMPLETE").exists());
++                assert!(
++                    started.elapsed() < Duration::from_millis(millis + 2000),
++                    "budget not bounded: {:?}",
++                    started.elapsed()
++                );
++            }
++            // Independently observe task-owned helper cleanup, even after target death.
++            let pid: u32 = fs::read_to_string(root.path().join("worker.pid"))
++                .unwrap()
++                .parse()
++                .unwrap();
++            let helper = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
++            if !helper.is_null() {
++                let mut exit = 259;
++                let stop = Instant::now();
++                while unsafe { GetExitCodeProcess(helper, &mut exit) } != 0
++                    && exit == 259
++                    && stop.elapsed() < Duration::from_secs(2)
++                {
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                unsafe {
++                    CloseHandle(helper);
++                }
++                assert_ne!(exit, 259, "orphan helper in {mode}");
++            }
++            eprintln!(
++                "0068 {mode}: target/helper terminated in {:?}",
++                started.elapsed()
++            );
++        }
++    }
++}
