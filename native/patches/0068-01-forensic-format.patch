@@ -1,0 +1,67 @@
+diff --git a/README.md b/README.md
+index bc1a84f..722117b 100644
+--- a/README.md
++++ b/README.md
+@@ -246,8 +246,13 @@ This build cannot safely resume a running title: device children are cached
+ for process lifetime, and lost GPU writes have no replayable safe point.
+ It makes zero automatic title recovery attempts, exits with `0xE0670001`
+ after verified preservation (`0xE0670002` if preservation is incomplete),
+-and prints the recovery folder. These are forensic snapshots, not loadable
+-save states; unsaved progress and shared-page consistency are not guaranteed.
++and prints the recovery folder. These are **FORENSIC ONLY**, never loadable save states. The RAM file header
++explicitly identifies that format. Threads currently keep running during the
++clone/copy: title object graphs, allocator metadata, descriptors, command/fence
++bookkeeping, save-operation buffers and storage can represent different instants
++or interrupted updates. Non-cloneable/inaccessible mappings, OS handles and
++GPU-only state are absent. Shared mappings can change even after cloning; RAM
++and committed saves are not an atomic checkpoint. Unsaved progress is not guaranteed.
+ Do not copy partial files over live saves. The no-title WARP diagnostics
+ probe releases all old objects and verifies device/library/heap recreation
+ and submission three times, then refuses a fourth attempt. That probe is
+diff --git a/crates/victory-hle/src/modules/d3d12x/recovery.rs b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+index 5a87d27..81f4154 100644
+--- a/crates/victory-hle/src/modules/d3d12x/recovery.rs
++++ b/crates/victory-hle/src/modules/d3d12x/recovery.rs
+@@ -54,7 +54,7 @@ pub(super) fn removed(event: &Removal) -> ! {
+             record("storage", copy_tree(&title.storage, &at.join("storage")));
+             write_verified(&at.join("README.txt"), |out| {
+                 out.write_all(
+-                b"Forensic snapshot; not a resumable checkpoint. ram.bin contains cloneable readable process RAM. Shared pages and storage may change during capture. GPU-only writes may be lost. Keep all generations; COMPLETE lists verified files. Saves are a copy of committed on-disk XGameSave state; unsaved progress is not guaranteed.\n")
++                b"Forensic snapshot; not a resumable checkpoint. ram.bin contains cloneable readable process RAM. Threads run during capture: title object graphs, allocator metadata, descriptors, command/fence state, save buffers and storage may tear across instants. Non-cloneable/inaccessible mappings, OS handles and GPU-only state are absent. Shared pages may change after cloning. GPU-only writes may be lost. Keep all generations; COMPLETE lists verified files. Saves are a copy of committed on-disk XGameSave state; unsaved progress is not guaranteed.\n")
+             })?;
+             if errors.is_empty() {
+                 Ok(())
+diff --git a/crates/victory-loader/src/recovery.rs b/crates/victory-loader/src/recovery.rs
+index 2e40fa7..0231f71 100644
+--- a/crates/victory-loader/src/recovery.rs
++++ b/crates/victory-loader/src/recovery.rs
+@@ -157,7 +157,7 @@ pub fn publish(root: &Path, write: impl FnOnce(&Path) -> io::Result<()>) -> io::
+ }
+ 
+ /// Captures cloneable private/image/section RAM before teardown. The archive is
+-/// SCARLRAM1, followed by records (base:u64, length:u64, protection:u32, type:u32,
++/// SCARLRAM2FORENSIC_ONLY\n (23 bytes), followed by records (base:u64, length:u64, protection:u32, type:u32,
+ /// bytes[length]), then an all-zero record. Inaccessible/uncommitted ranges
+ /// are excluded; guard protection is removed only in the clone. Read failures abort publication rather than claiming completeness.
+ /// Shareable sections may change while copied: forensic data, never a safe point.
+@@ -204,7 +204,7 @@ pub fn capture_ram(file: &Path) -> io::Result<u64> {
+         return Err(io::Error::from_raw_os_error(error as i32));
+     }
+     write_verified(file, |out| {
+-        out.write_all(b"SCARLRAM1")?;
++        out.write_all(b"SCARLRAM2FORENSIC_ONLY\n")?;
+         let mut at = 0usize;
+         let mut buffer = vec![0; 1 << 20];
+         loop {
+@@ -392,9 +392,9 @@ mod tests {
+         );
+         assert!(bytes > 4096);
+         let mut input = File::open(file).unwrap();
+-        let mut magic = [0; 9];
++        let mut magic = [0; 23];
+         input.read_exact(&mut magic).unwrap();
+-        assert_eq!(&magic, b"SCARLRAM1");
++        assert_eq!(&magic, b"SCARLRAM2FORENSIC_ONLY\n");
+         let mut regions = 0;
+         let mut guarded = false;
+         loop {
