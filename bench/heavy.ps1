@@ -341,7 +341,7 @@ function Receive-RingRows($Ring, $Into) {
     for ($s = $next; $s -le $newest; $s++) {
         $row = Read-RingRow $Ring $s
         if ($null -eq $row) { break }
-        $Into.Add(@{ Seq = $s; Row = $row[0] }); $Ring.Last = $s; $got++
+        $Into.Add(@{ Seq = $s; Row = $row }); $Ring.Last = $s; $got++
     }
     return $got
 }
