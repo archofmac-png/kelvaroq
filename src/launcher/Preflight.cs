@@ -159,7 +159,9 @@ internal static class Preflight {
         list.Add(Guarded("gameDir","Game directory",false,() => {
             if (String.IsNullOrEmpty(f.GameRoot) || !Directory.Exists(f.GameRoot))
                 return Make("gameDir","Game directory",false,PreflightLevel.Block,"game directory not found: '" + f.GameRoot + "'. Fix: pick the folder with MicrosoftGame.Config in the launcher.");
-            if (!String.IsNullOrEmpty(f.Image) && !File.Exists(f.Image))
+            if (String.IsNullOrEmpty(f.Image))
+                return Make("gameDir","Game directory",false,PreflightLevel.Block,"no executable: the folder has no MicrosoftGame.Config executable to run. Fix: put the title's executable beside MicrosoftGame.Config, or pick the executable itself.");
+            if (!File.Exists(f.Image))
                 return Make("gameDir","Game directory",false,PreflightLevel.Block,"executable not found: '" + f.Image + "'. Fix: restore the file or pick the executable again.");
             return Make("gameDir","Game directory",false,PreflightLevel.Pass,f.GameRoot);
         }));
@@ -282,11 +284,18 @@ internal static class Preflight {
 
     /// kelvaroq-desktop.exe --doctor [exe-or-folder]. Exit 0 clean, 2 blocked, 1 could not run.
     internal static int RunDoctor(string[] args,string home) {
+        File.AppendAllText(@"C:\dev\scarlett-port\logs\dbg.txt", "enter" + Environment.NewLine);
         OpenOutput();
+        File.AppendAllText(@"C:\dev\scarlett-port\logs\dbg.txt", "output open" + Environment.NewLine);
         var prefs = Preferences.Load(home);
+        File.AppendAllText(@"C:\dev\scarlett-port\logs\dbg.txt", "prefs" + Environment.NewLine);
         string selection = args.Length > 1 ? args[1] : prefs.executable;
         var hardware = Hardware.Enabled ? Hardware.Detect() : null;
-        return Doctor(PreflightFacts.Live(hardware,selection,prefs),Console.Out);
+        File.AppendAllText(@"C:\dev\scarlett-port\logs\dbg.txt", "hardware" + Environment.NewLine);
+        var f = PreflightFacts.Live(hardware,selection,prefs);
+        File.AppendAllText(@"C:\dev\scarlett-port\logs\dbg.txt", "facts" + Environment.NewLine);
+        return Doctor(f,Console.Out);
     }
 }
 }
+
