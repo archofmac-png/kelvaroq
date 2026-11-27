@@ -1,0 +1,208 @@
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index d89cf87..cc2423f 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -22,9 +22,15 @@ use clap::{Parser, Subcommand, ValueEnum};
+     version,
+     about = "Run an Xbox Series title natively on Windows"
+ )]
++#[command(args_conflicts_with_subcommands = true)]
+ struct Cli {
++    /// Load the configuration, require the game directory and create the
++    /// cache and data directories; report every problem found (with the
++    /// file, line and column for a parse error) and exit 2 if there are any.
++    #[arg(long)]
++    check_config: bool,
+     #[command(subcommand)]
+-    command: Command,
++    command: Option<Command>,
+ }
+ 
+ #[derive(Subcommand)]
+@@ -150,7 +156,23 @@ fn main() -> Result<()> {
+         return Ok(());
+     }
+     let cli = Cli::parse();
+-    match cli.command {
++    if cli.check_config {
++        let problems = check_config();
++        for p in &problems {
++            eprintln!("{p}");
++        }
++        std::process::exit(if problems.is_empty() { 0 } else { 2 });
++    }
++    let Some(command) = cli.command else {
++        use clap::CommandFactory;
++        Cli::command()
++            .error(
++                clap::error::ErrorKind::MissingSubcommand,
++                "a subcommand or --check-config is required",
++            )
++            .exit();
++    };
++    match command {
+         Command::Inspect {
+             file,
+             imports,
+@@ -202,6 +224,49 @@ fn main() -> Result<()> {
+     }
+ }
+ 
++/// Everything `--check-config` finds wrong, one entry per problem. A config
++/// that does not parse stops the later checks (there is no config to check);
++/// after that, each check runs whatever the others found.
++fn check_config() -> Vec<String> {
++    let cfg = match victory_core::Config::load() {
++        Ok(cfg) => cfg,
++        Err(e) => return vec![describe_load_error(&e)],
++    };
++    let mut problems = Vec::new();
++    if let Err(e) = cfg.require_game_dir() {
++        problems.push(format!("game_dir: {e:#}"));
++    }
++    for (what, sub) in [("cache_dir", cfg.cache_subdir("shaders")), ("cache_dir", cfg.cache_subdir("images"))] {
++        if let Err(e) = sub {
++            problems.push(format!("{what}: {e:#}"));
++        }
++    }
++    if let Err(e) = cfg.data_subdir("") {
++        problems.push(format!("data_dir: {e:#}"));
++    }
++    problems
++}
++
++/// A parse error is shown as `file:line:column: message`, the source line
++/// and a caret; serde's message (which names the field) is kept verbatim.
++fn describe_load_error(e: &anyhow::Error) -> String {
++    let Some(pe) = e.downcast_ref::<victory_core::ParseError>() else {
++        return format!("config: {e:#}");
++    };
++    match pe.location() {
++        Some(at) => format!(
++            "{}:{}:{}: {}\n  {}\n  {}^",
++            pe.path.display(),
++            at.line,
++            at.column,
++            pe.message().trim_end(),
++            at.source_line,
++            " ".repeat(at.column - 1),
++        ),
++        None => format!("{}: {}", pe.path.display(), pe.message().trim_end()),
++    }
++}
++
+ fn show_config() -> Result<()> {
+     let cfg = victory_core::Config::load()?;
+     let status = |p: &Option<PathBuf>| match p {
+diff --git a/crates/victory-core/src/config.rs b/crates/victory-core/src/config.rs
+index b65014e..ebd6ad5 100644
+--- a/crates/victory-core/src/config.rs
++++ b/crates/victory-core/src/config.rs
+@@ -43,6 +43,60 @@ struct FilePaths {
+     test_titles: Vec<PathBuf>,
+ }
+ 
++/// The config file did not parse. Keeps the text and the `toml` error so a
++/// caller can point at the offending line (`--check-config`); the error
++/// chain reads as before ("parsing <path>" caused by toml's message).
++#[derive(Debug)]
++pub struct ParseError {
++    pub path: PathBuf,
++    pub text: String,
++    pub error: toml::de::Error,
++}
++
++/// Where a [`ParseError`] points: 1-based line and column (in characters)
++/// and the text of that line.
++#[derive(Debug, PartialEq, Eq)]
++pub struct Location<'a> {
++    pub line: usize,
++    pub column: usize,
++    pub source_line: &'a str,
++}
++
++impl ParseError {
++    /// The error's own message (serde's, so it names the field).
++    pub fn message(&self) -> &str {
++        self.error.message()
++    }
++
++    /// The start of the offending span, if `toml` gave one.
++    pub fn location(&self) -> Option<Location<'_>> {
++        let start = self.error.span()?.start.min(self.text.len());
++        let start = (0..=start).rev().find(|&i| self.text.is_char_boundary(i))?;
++        let before = &self.text[..start];
++        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
++        let line_end = self.text[start..]
++            .find('\n')
++            .map_or(self.text.len(), |i| start + i);
++        Some(Location {
++            line: before.matches('\n').count() + 1,
++            column: self.text[line_start..start].chars().count() + 1,
++            source_line: self.text[line_start..line_end].trim_end_matches('\r'),
++        })
++    }
++}
++
++impl std::fmt::Display for ParseError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "parsing {}", self.path.display())
++    }
++}
++
++impl std::error::Error for ParseError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.error)
++    }
++}
++
+ impl Config {
+     /// Loads configuration from the environment and the config file.
+     pub fn load() -> Result<Self> {
+@@ -64,8 +118,11 @@ impl Config {
+         };
+         let (source, parsed) = match file {
+             Some((path, text)) => {
+-                let parsed: FileConfig =
+-                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
++                let parsed: FileConfig = toml::from_str(&text).map_err(|error| ParseError {
++                    path: path.clone(),
++                    text: text.clone(),
++                    error,
++                })?;
+                 (Some(path), parsed)
+             }
+             None => (None, FileConfig::default()),
+@@ -195,6 +252,21 @@ mod tests {
+         assert!(parsed.paths.game_dir.is_some());
+     }
+ 
++    #[test]
++    fn parse_error_locates_unknown_field() {
++        let text = "[paths]\r\ngame_dir = 'x'\r\ngmae_dir = 'y'\r\n";
++        let error = toml::from_str::<FileConfig>(text).unwrap_err();
++        let e = ParseError {
++            path: "victory.toml".into(),
++            text: text.into(),
++            error,
++        };
++        let at = e.location().unwrap();
++        assert_eq!((at.line, at.column, at.source_line), (3, 1, "gmae_dir = 'y'"));
++        assert!(e.message().contains("unknown field"), "{}", e.message());
++        assert!(e.message().contains("gmae_dir"), "{}", e.message());
++    }
++
+     #[test]
+     fn cache_inside_repo_is_refused() {
+         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
+diff --git a/crates/victory-core/src/lib.rs b/crates/victory-core/src/lib.rs
+index 011df7e..9cd728c 100644
+--- a/crates/victory-core/src/lib.rs
++++ b/crates/victory-core/src/lib.rs
+@@ -9,5 +9,5 @@ pub mod config;
+ pub mod logging;
+ pub mod policy;
+ 
+-pub use config::Config;
++pub use config::{Config, ParseError};
+ pub use policy::{PolicyError, ensure_outside_repo};
