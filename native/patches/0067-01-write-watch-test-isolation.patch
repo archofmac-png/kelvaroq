@@ -1,0 +1,33 @@
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index a472e91..c9e03c4 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -1410,6 +1410,28 @@ pub(crate) mod tests {
+ 
+     #[test]
+     fn written_pages_are_reported_to_every_asker() {
++        // This test asserts a fresh journal. Other tests intentionally retain
++        // process-global dirty stamps, and Windows can reuse their freed VAs.
++        // Keep the actual OS/write-watch assertions in a fresh process.
++        const CHILD: &str = "VICTORY_0067_WRITE_WATCH_CHILD";
++        if std::env::var_os(CHILD).is_none() {
++            struct Child(std::process::Child);
++            impl Drop for Child {
++                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
++            }
++            let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
++                .args(["--exact", "watch::tests::written_pages_are_reported_to_every_asker", "--test-threads=1"])
++                .env(CHILD, "1").spawn().unwrap());
++            let started = std::time::Instant::now();
++            loop {
++                if let Some(status) = child.0.try_wait().unwrap() {
++                    assert!(status.success(), "isolated write-watch test failed: {status}");
++                    return;
++                }
++                assert!(started.elapsed() < std::time::Duration::from_secs(30), "write-watch child timed out");
++                std::thread::sleep(std::time::Duration::from_millis(10));
++            }
++        }
+         // SAFETY: a fresh write-watched allocation, freed at the end.
+         let p = unsafe {
+             VirtualAlloc(
