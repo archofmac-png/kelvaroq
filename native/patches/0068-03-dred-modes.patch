@@ -1,0 +1,167 @@
+diff --git a/README.md b/README.md
+index 250ce52..ff266da 100644
+--- a/README.md
++++ b/README.md
+@@ -233,6 +233,16 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
+ > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+ 
+ `VICTORY_RECOVER_REMOVAL=1` opts into forensic capture (default off).
++Before device creation this selects DRED page-fault tracking with
++AutoBreadcrumbs explicitly **off**. Allocation/object lifetime tracking and
++object names still cost CPU/memory at creation/destruction. Per-command notes,
++markers and AutoBreadcrumb metadata/progress recording are disabled by default.
++`VICTORY_RECOVER_REMOVAL_BREADCRUMBS=1` separately opts into that recurring
++command-list/allocation/submission cost, including ExecuteCommandLists tracking.
++The diagnostics `VICTORY_D3D12_DRED` flag cannot bypass this recovery sub-flag.
++Without breadcrumbs, pending command count is unavailable (`null`). No title
++CPU/frame-time delta has been measured for either mode.
++
+ After removal, a separate instance of this executable suspends every title
+ process thread except a dedicated termination watchdog, then clones readable
+ cloneable RAM and copies committed saves/storage under `<title data>/recovery`.
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 9aeccb1..8c553a7 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -603,14 +603,21 @@ fn create() -> windows::core::Result<Host> {
+                 tracing::info!("GPU-based validation on");
+             }
+         }
+-        // Diagnostics: device-removed data (the command that faulted, the
+-        // faulting address), read when the device is removed.
++        // Configure before device creation: page-fault tracking adds object
++        // lifetime bookkeeping/memory. AutoBreadcrumbs additionally allocates
++        // command-list metadata and records/tracks progress for submissions;
++        // recovery requires a separate explicit opt-in to that recurring cost.
+         if dred_on() {
+             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+             if D3D12GetDebugInterface(&mut dred).is_ok()
+                 && let Some(dred) = dred
+             {
+-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
++                dred.SetAutoBreadcrumbsEnablement(if dred_breadcrumbs_on() {
++                    D3D12_DRED_ENABLEMENT_FORCED_ON
++                } else {
++                    // Explicit OFF also prevents system-controlled activation.
++                    D3D12_DRED_ENABLEMENT_FORCED_OFF
++                });
+                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+             }
+         }
+@@ -1408,15 +1415,50 @@ fn record_twin_copy(
+     }
+ }
+ 
+-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
+-/// builds).
+-pub(crate) fn dred_on() -> bool {
+-    static ON: OnceLock<bool> = OnceLock::new();
+-    *ON.get_or_init(|| {
+-        crate::removal::enabled() || (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some())
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum DredMode {
++    Off,
++    PageFaults,
++    Breadcrumbs,
++}
++
++// Recovery's explicit sub-flag wins over the legacy diagnostics flag: setting
++// VICTORY_D3D12_DRED must not silently enable per-command work during recovery.
++fn dred_policy(recovery: bool, recovery_breadcrumbs: bool, diagnostics_dred: bool) -> DredMode {
++    if recovery {
++        if recovery_breadcrumbs {
++            DredMode::Breadcrumbs
++        } else {
++            DredMode::PageFaults
++        }
++    } else if diagnostics_dred {
++        DredMode::Breadcrumbs
++    } else {
++        DredMode::Off
++    }
++}
++
++fn dred_mode() -> DredMode {
++    static MODE: OnceLock<DredMode> = OnceLock::new();
++    *MODE.get_or_init(|| {
++        dred_policy(
++            crate::removal::enabled(),
++            std::env::var_os("VICTORY_RECOVER_REMOVAL_BREADCRUMBS").is_some_and(|v| v == "1"),
++            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some(),
++        )
+     })
+ }
+ 
++/// Recovery uses page-fault data by default. This retains object lifetime and
++/// naming costs, but no AutoBreadcrumbs or our per-command diagnostic markers.
++pub(crate) fn dred_on() -> bool {
++    dred_mode() != DredMode::Off
++}
++
++fn dred_breadcrumbs_on() -> bool {
++    dred_mode() == DredMode::Breadcrumbs
++}
++
+ /// Indirect mesh dispatches since the last frame line: the largest group
+ /// count a record asked for, and the groups asked in all (from the lists'
+ /// budget buffers, a run late).
+@@ -6349,6 +6391,9 @@ impl Host {
+     }
+ 
+     fn removal_command_count(&self) -> Option<u64> {
++        if !dred_breadcrumbs_on() {
++            return None;
++        }
+         let dred = self.device.cast::<ID3D12DeviceRemovedExtendedData1>().ok()?;
+         // SAFETY: the device owns this bounded linked list throughout the copy.
+         unsafe {
+@@ -6414,6 +6459,10 @@ impl Host {
+                     text.push_str(&crate::descriptor::host::near_heaps(va));
+                 }
+             }
++            if !dred_breadcrumbs_on() {
++                text.push_str("; AutoBreadcrumbs disabled by policy");
++                return text;
++            }
+             // The plain output: the extended one (with marker texts) came
+             // back without stopped lists on this host.
+             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+@@ -7032,7 +7081,7 @@ impl HostList {
+ 
+     #[cfg(feature = "diagnostics")]
+     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+-        if !dred_on() {
++        if !dred_breadcrumbs_on() {
+             crate::capture::op(std::ptr::from_ref(self) as usize, what);
+             return;
+         }
+@@ -9479,6 +9528,29 @@ fn pump() {
+ 
+ #[cfg(test)]
+ mod trail {
++    #[test]
++    fn recovery_dred_requires_separate_breadcrumb_opt_in() {
++        use super::{DredMode, dred_policy};
++        for diagnostics_dred in [false, true] {
++            assert_eq!(
++                dred_policy(true, false, diagnostics_dred),
++                DredMode::PageFaults
++            );
++            assert_eq!(
++                dred_policy(true, true, diagnostics_dred),
++                DredMode::Breadcrumbs
++            );
++        }
++        // A standalone recovery sub-flag does not enable recovery or DRED.
++        for recovery_breadcrumbs in [false, true] {
++            assert_eq!(dred_policy(false, recovery_breadcrumbs, false), DredMode::Off);
++            assert_eq!(
++                dred_policy(false, recovery_breadcrumbs, true),
++                DredMode::Breadcrumbs
++            );
++        }
++    }
++
+     #[test]
+     fn removal_history_wraps_without_reading_past_the_dred_ring() {
+         use super::*;
