@@ -47,3 +47,13 @@ jobs:
           python -m ruff format --check research scripts
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -m unittest discover -v -s research/tests
+      - name: Auto-tests des outils de mesure
+        shell: pwsh
+        run: |
+          # The harness is what every perf claim rests on. Its self-tests need no game data.
+          ./bench/heavy.ps1 -Mode SelfTest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./bench/capture.ps1 -Mode SelfTest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./bench/render-verify.ps1 -Mode SelfTest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
