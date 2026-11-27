@@ -1,0 +1,827 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 9fb54f9..ef42f5f 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1599,6 +1599,9 @@ impl State {
+                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
+                         // Ours, not the title's: the shader picks buffers
+                         // from the view heap by an index it computes.
++                        if t.stores {
++                            list.incomplete_writes();
++                        }
+                         match self.heap_buffers(list) {
+                             Some(gpu) => {
+                                 self.bind_resource(list, compute, param, RootResource::Srv(gpu))
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 2493c5a..b0e2267 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2173,6 +2173,7 @@ struct CardRange {
+     compared: bool,
+ }
+ 
++mod prefix_settle;
+ pub(crate) mod relay_patch;
+ mod uma;
+ 
+@@ -2251,6 +2252,8 @@ struct Deferred {
+     /// The range also tells the relay which older writes they can observe.
+     direct: std::collections::HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+     pool_bound: Option<usize>,
++    /// Dynamic/aliased writers cannot use a precise dependency prefix.
++    incomplete_writes: bool,
+     direct_requests: u64,
+     direct_bytes: u64,
+     /// Textures whose contents the list brings up to date.
+@@ -2872,6 +2875,7 @@ static CONSTANT_FILLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+ /// What [`Host::submit`] hands back for a submission it sent and did not
+ /// wait for.
+ struct Sent {
++    prefix_writes: Option<prefix_settle::Writes>,
+     /// Its number among the submissions started.
+     number: u64,
+     card: Option<CardPlan>,
+@@ -2905,6 +2909,7 @@ enum Late {
+ }
+ 
+ struct Line {
++    prefix: prefix_settle::Pending,
+     line: Vec<Late>,
+     /// The title memory the flights' shaders may write (address, end), in
+     /// order and joined.
+@@ -2935,6 +2940,7 @@ struct Line {
+ unsafe impl Send for Line {}
+ 
+ static LINE: Mutex<Line> = Mutex::new(Line {
++    prefix: prefix_settle::Pending::new(),
+     line: Vec::new(),
+     written: Vec::new(),
+     lists: 0,
+@@ -5878,6 +5884,7 @@ impl Host {
+         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+         {
+             let mut line = line();
++            line.prefix.landed(last);
+             let Line {
+                 line: items,
+                 written,
+@@ -6143,6 +6150,7 @@ impl Host {
+         let told = !sent.writes.is_empty();
+         let most = {
+             let mut line = line();
++            line.prefix.push(sent.prefix_writes);
+             let Line {
+                 line: items,
+                 written,
+@@ -6210,6 +6218,7 @@ impl Host {
+         let number = sent.number;
+         {
+             let mut line = line();
++            line.prefix.push(sent.prefix_writes);
+             let Line {
+                 line: items,
+                 written,
+@@ -6250,6 +6259,38 @@ impl Host {
+         number
+     }
+ 
++    /// Wait only for the newest overlapping writer; an unknown set keeps
++    /// the full-settle correctness path. Repeated targets do not wait again.
++    fn settle_reads(
++        &self,
++        submitted: &mut u64,
++        runs: &[&HostList],
++        gpu_fills: &std::collections::HashSet<usize>,
++        why: usize,
++        settled: &mut u64,
++    ) {
++        if line().prefix.is_empty() {
++            return;
++        }
++        let summary = prefix_settle::reads(runs, gpu_fills, true);
++        let plan = line().prefix.bound_plan(&summary);
++        let plan = if plan == prefix_settle::Plan::Check {
++            let reads = prefix_settle::reads(runs, gpu_fills, false);
++            line().prefix.plan(&reads, *settled)
++        } else {
++            plan
++        };
++        match plan {
++            prefix_settle::Plan::None => {}
++            prefix_settle::Plan::Through(target) => {
++                relay_wait(why, |line| line.prefix.landed_through >= target);
++                *settled = target;
++            }
++            prefix_settle::Plan::Full => self.settle(submitted, why),
++            prefix_settle::Plan::Check => unreachable!("detailed prefix plan"),
++        }
++    }
++
+     /// Waits for the card to run every flight in the air ([`late`]) and
+     /// does what they left to do, as [`Host::execute`] does for one
+     /// submission after its wait: the pieces their shaders wrote in copies
+@@ -6627,8 +6668,17 @@ impl Host {
+         // Flights in the air ([`late`]): a submission that is waited for
+         // settles them first, one sent ahead only if preparing it reads
+         // what they write.
++        let mut prefix_settled = 0;
+         if !late {
+             self.settle(&mut submitted, WHY_SYNC);
++        } else if prefix_settle::enabled() && relay() {
++            self.settle_reads(
++                &mut submitted,
++                runs,
++                &gpu_fills,
++                WHY_READ,
++                &mut prefix_settled,
++            );
+         } else if let Some(why) = late_blocked(runs, &gpu_fills) {
+             if relay_exact() && why == WHY_READ {
+                 // Only until the flights that may write what is read have
+@@ -6727,7 +6777,11 @@ impl Host {
+             // All reads of title bytes, the second write-watch query and
+             // all sends to the card stay on the far side of the same wait.
+             let settling = std::time::Instant::now();
+-            self.settle(submitted, WHY_STALE);
++            if prefix_settle::enabled() && relay() {
++                self.settle_reads(submitted, runs, &gpu_fills, WHY_STALE, &mut prefix_settled);
++            } else {
++                self.settle(submitted, WHY_STALE);
++            }
+             settled += settling.elapsed();
+         };
+         // One write-watch asking for everything the submission refreshes
+@@ -6854,7 +6908,10 @@ impl Host {
+             submitting(0, 0);
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::submission_ends(lock);
++            let prefix_writes = (prefix_settle::enabled() && relay())
++                .then(|| prefix_settle::Writes::recording(this_submission, runs, &back));
+             let sent = Sent {
++                prefix_writes,
+                 number: this_submission,
+                 card,
+                 back,
+@@ -7963,6 +8020,12 @@ impl HostList {
+         }
+     }
+ 
++    pub(crate) fn incomplete_writes(&self) {
++        if prefix_settle::enabled() {
++            self.deferred().incomplete_writes = true;
++        }
++    }
++
+     pub(crate) fn raw_pool_bound(&self, bound: usize) {
+         let mut recording = self.deferred();
+         recording.pool_bound = Some(recording.pool_bound.map_or(bound, |n| n.min(bound)));
+diff --git a/crates/victory-gpu/src/host/prefix_settle.rs b/crates/victory-gpu/src/host/prefix_settle.rs
+new file mode 100644
+index 0000000..9428abc
+--- /dev/null
++++ b/crates/victory-gpu/src/host/prefix_settle.rs
+@@ -0,0 +1,541 @@
++//! FIFO dependency watermarks. Metadata outlives removal from the relay queue:
++//! a flight stops being a writer only after all of its publications finish.
++
++use super::*;
++
++pub(super) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PREFIX_SETTLE").is_some_and(|v| v == "1"))
++}
++
++#[derive(Default)]
++pub(super) struct Ranges {
++    ranges: Vec<(usize, usize)>,
++    envelope: Option<(usize, usize)>,
++    summary_only: bool,
++    incomplete: bool,
++}
++
++impl Ranges {
++    fn add(&mut self, at: usize, bytes: usize) {
++        if bytes == 0 {
++            return;
++        }
++        match at.checked_add(bytes) {
++            Some(end) => {
++                self.envelope = Some(match self.envelope {
++                    Some((a, b)) => (a.min(at), b.max(end)),
++                    None => (at, end),
++                });
++                if !self.summary_only {
++                    self.ranges.push((at, end));
++                }
++            }
++            None => self.incomplete = true,
++        }
++    }
++
++    fn private(&self) -> bool {
++        !self.incomplete
++            && self.ranges.iter().all(|&(a, b)| {
++                a < b
++                    && !crate::remap::overlaps(a, b - a)
++                    && crate::inplace::private_whole(a, b - a)
++            })
++    }
++}
++
++pub(super) struct Writes {
++    number: u64,
++    epoch: u64,
++    ranges: Ranges,
++}
++
++impl Writes {
++    pub(super) fn recording(number: u64, runs: &[&HostList], back: &[Declared]) -> Self {
++        let mut ranges = Ranges::default();
++        for (_, spans) in back {
++            ranges.ranges.extend_from_slice(spans);
++        }
++        for list in runs {
++            let recording = list.deferred();
++            ranges.incomplete |= recording.incomplete_writes;
++            for &(at, _, bytes) in &recording.writes {
++                ranges.add(at, bytes);
++            }
++            for (_, at, [row, rows, pitch]) in &recording.backs {
++                if *row == 0 || *rows == 0 {
++                    continue;
++                }
++                match (rows - 1)
++                    .checked_mul(*pitch)
++                    .and_then(|n| n.checked_add(*row))
++                {
++                    Some(bytes) => ranges.add(*at, bytes),
++                    None => ranges.incomplete = true,
++                }
++            }
++        }
++        let epoch = if let Some(_mapping) = crate::watch::title_memory_reading_now() {
++            ranges.incomplete |= !ranges.private();
++            crate::watch::mapping_epoch()
++        } else {
++            ranges.incomplete = true;
++            crate::watch::mapping_epoch()
++        };
++        Self {
++            number,
++            epoch,
++            ranges,
++        }
++    }
++}
++
++#[derive(Default)]
++pub(super) struct Pending {
++    flights: Vec<Writes>,
++    envelope: Option<(usize, usize)>,
++    incomplete: bool,
++    epoch: Option<u64>,
++    pub(super) landed_through: u64,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) enum Plan {
++    None,
++    Through(u64),
++    Full,
++    Check,
++}
++
++impl Pending {
++    pub(super) const fn new() -> Self {
++        Self {
++            flights: Vec::new(),
++            envelope: None,
++            incomplete: false,
++            epoch: None,
++            landed_through: 0,
++        }
++    }
++
++    pub(super) fn is_empty(&self) -> bool {
++        self.flights.is_empty()
++    }
++
++    pub(super) fn push(&mut self, writes: Option<Writes>) {
++        if let Some(writes) = writes {
++            self.epoch = if self.flights.is_empty() {
++                Some(writes.epoch)
++            } else if self.epoch == Some(writes.epoch) {
++                self.epoch
++            } else {
++                None
++            };
++            self.incomplete |= writes.ranges.incomplete;
++            for &(a, b) in &writes.ranges.ranges {
++                if a >= b {
++                    continue;
++                }
++                self.envelope = Some(match self.envelope {
++                    Some((c, d)) => (a.min(c), b.max(d)),
++                    None => (a, b),
++                });
++            }
++            self.flights.push(writes);
++        }
++    }
++
++    pub(super) fn landed(&mut self, number: u64) {
++        self.landed_through = self.landed_through.max(number);
++        self.flights.retain(|f| f.number > self.landed_through);
++        self.envelope = None;
++        self.incomplete = false;
++        self.epoch = self.flights.first().map(|f| f.epoch);
++        for flight in &self.flights {
++            self.incomplete |= flight.ranges.incomplete;
++            if self.epoch != Some(flight.epoch) {
++                self.epoch = None;
++            }
++            for &(a, b) in &flight.ranges.ranges {
++                if a >= b {
++                    continue;
++                }
++                self.envelope = Some(match self.envelope {
++                    Some((c, d)) => (a.min(c), b.max(d)),
++                    None => (a, b),
++                });
++            }
++        }
++    }
++
++    fn select(&self, reads: &Ranges, settled: u64) -> Plan {
++        // Unknown writers must be checked BEFORE any disjoint-range shortcut.
++        if reads.incomplete || self.incomplete {
++            return Plan::Full;
++        }
++        for flight in self.flights.iter().rev() {
++            if flight.number <= settled.max(self.landed_through) {
++                continue;
++            }
++            if flight
++                .ranges
++                .ranges
++                .iter()
++                .any(|&(a, b)| reads.ranges.iter().any(|&(c, d)| a < d && c < b))
++            {
++                return Plan::Through(flight.number);
++            }
++        }
++        Plan::None
++    }
++
++    pub(super) fn bound_plan(&self, reads: &Ranges) -> Plan {
++        if self.flights.is_empty() {
++            return Plan::None;
++        }
++        if self.incomplete || reads.incomplete {
++            return Plan::Full;
++        }
++        let Some(_mapping) = crate::watch::title_memory_reading_now() else {
++            return Plan::Full;
++        };
++        if self.epoch != Some(crate::watch::mapping_epoch()) {
++            return Plan::Full;
++        }
++        // All producers were proven private and untranslated at this epoch.
++        // An ordinary section reader cannot alias private storage. A logical
++        // remap can, so reject it, including remaps inside the read envelope.
++        let Some((c, d)) = reads.envelope else {
++            return Plan::None;
++        };
++        if crate::remap::overlaps(c, d - c) {
++            return Plan::Full;
++        }
++        let Some((a, b)) = self.envelope else {
++            return Plan::None;
++        };
++        if a >= d || c >= b {
++            Plan::None
++        } else {
++            Plan::Check
++        }
++    }
++
++    pub(super) fn plan(&self, reads: &Ranges, settled: u64) -> Plan {
++        match self.bound_plan(reads) {
++            Plan::Check => self.select(reads, settled),
++            plan => plan,
++        }
++    }
++}
++
++/// The ordinary prepare-time reads, and for a stale refresh the whole span
++/// each shadow may flush (including gaps between recorded views).
++pub(super) fn reads(
++    runs: &[&HostList],
++    gpu_fills: &std::collections::HashSet<usize>,
++    summary_only: bool,
++) -> Ranges {
++    let mut reads = Ranges {
++        summary_only,
++        ..Default::default()
++    };
++    let mut refreshes: Vec<(usize, usize, usize)> = Vec::new();
++    for list in runs {
++        let recording = list.deferred();
++        reads.incomplete |= recording.pool_bound.is_some();
++        for &(_, a, b) in recording.direct.values() {
++            if a <= b {
++                reads.add(a, b - a);
++            } else {
++                reads.incomplete = true;
++            }
++        }
++        for step in &recording.copies {
++            match step {
++                &Step::Copy(dst, src, n) => {
++                    reads.add(src, n);
++                    reads.add(dst, n);
++                }
++                &Step::Fill(dst, src, n, _) => {
++                    if !gpu_fills.contains(&dst) {
++                        reads.add(src, n);
++                    }
++                }
++                Step::Texture(staging) => {
++                    let (at, n) = staging.memory();
++                    reads.add(at, n);
++                }
++                Step::Run(_) | Step::Host(_) => reads.incomplete = true,
++                Step::Refresh(shadow, a, n)
++                | Step::PoolRead(shadow, a, n)
++                | Step::GpuWrite(shadow, a, n) => {
++                    let Some(b) = a.checked_add(*n) else {
++                        reads.incomplete = true;
++                        continue;
++                    };
++                    if summary_only {
++                        reads.add(*a, *n);
++                        continue;
++                    }
++                    let owner = std::sync::Arc::as_ptr(shadow) as usize;
++                    match refreshes.iter_mut().find(|r| r.0 == owner) {
++                        Some(span) => {
++                            span.1 = span.1.min(*a);
++                            span.2 = span.2.max(b);
++                        }
++                        None => refreshes.push((owner, *a, b)),
++                    }
++                }
++            }
++        }
++    }
++    for (_, a, b) in refreshes {
++        reads.add(a, b - a);
++    }
++    reads
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn spans(ranges: &[(usize, usize)]) -> Ranges {
++        let mut out = Ranges::default();
++        for &(a, b) in ranges {
++            if a <= b {
++                out.add(a, b - a);
++            }
++        }
++        out
++    }
++    fn pending() -> Pending {
++        let mut pending = Pending::new();
++        for (number, range) in [(1, (10, 20)), (2, (30, 40)), (3, (50, 60))] {
++            pending.push(Some(Writes {
++                number,
++                epoch: 0,
++                ranges: spans(&[range]),
++            }));
++        }
++        pending
++    }
++
++    #[test]
++    fn no_overlap_settles_nothing_including_adjacent_and_empty_ranges() {
++        let pending = pending();
++        assert_eq!(pending.select(&spans(&[]), 0), Plan::None);
++        assert_eq!(
++            pending.select(&spans(&[(20, 30), (60, 70), (15, 15)]), 0),
++            Plan::None
++        );
++    }
++
++    #[test]
++    fn newest_overlap_waits_only_for_that_prefix() {
++        let mut pending = pending();
++        assert_eq!(
++            pending.select(&spans(&[(11, 12), (31, 32)]), 0),
++            Plan::Through(2)
++        );
++        pending.landed(2);
++        assert_eq!(
++            pending.flights.iter().map(|f| f.number).collect::<Vec<_>>(),
++            [3]
++        );
++        assert_eq!(pending.select(&spans(&[(11, 12), (31, 32)]), 2), Plan::None);
++    }
++
++    #[test]
++    fn repeated_flight_or_read_settles_once_and_only_newer_targets_advance() {
++        let mut pending = pending();
++        pending.push(Some(Writes {
++            number: 3,
++            epoch: 0,
++            ranges: spans(&[(50, 60)]),
++        }));
++        let reads = spans(&[(51, 52), (51, 52)]);
++        assert_eq!(pending.select(&reads, 0), Plan::Through(3));
++        assert_eq!(pending.select(&reads, 3), Plan::None);
++        pending.landed(3);
++        assert_eq!(pending.select(&reads, 0), Plan::None);
++    }
++
++    #[test]
++    fn unknown_writes_or_reads_keep_full_settle_reachable() {
++        let mut pending = pending();
++        pending.flights[0].ranges.incomplete = true;
++        pending.incomplete = true;
++        assert_eq!(pending.select(&spans(&[(70, 80)]), 0), Plan::Full);
++        let mut reads = spans(&[]);
++        reads.incomplete = true;
++        assert_eq!(Pending::new().select(&reads, 0), Plan::Full);
++    }
++
++    #[test]
++    fn in_hand_writers_remain_dependencies_until_publication() {
++        let mut pending = pending();
++        // Taking Run(2) out of Line.line does not call landed(2).
++        assert_eq!(pending.select(&spans(&[(31, 32)]), 0), Plan::Through(2));
++        pending.landed(1);
++        assert_eq!(pending.select(&spans(&[(31, 32)]), 0), Plan::Through(2));
++        pending.landed(2);
++        assert_eq!(pending.select(&spans(&[(31, 32)]), 0), Plan::None);
++    }
++
++    #[test]
++    fn changed_mapping_generation_invalidates_private_proofs() {
++        let bytes = Box::new([0u64; 2]);
++        let at = bytes.as_ptr() as usize;
++        let mut pending = Pending::new();
++        pending.push(Some(Writes {
++            number: 1,
++            epoch: crate::watch::mapping_epoch(),
++            ranges: spans(&[(at, at + 8)]),
++        }));
++        let reads = spans(&[(at + 8, at + 16)]);
++        assert_eq!(pending.plan(&reads, 0), Plan::None);
++        crate::watch::invalidate_mapping_proofs();
++        assert_eq!(pending.plan(&reads, 0), Plan::Full);
++    }
++
++    #[test]
++    fn range_overflow_requires_full_settle() {
++        let mut reads = Ranges::default();
++        reads.add(usize::MAX, 1);
++        assert_eq!(pending().select(&reads, 0), Plan::Full);
++    }
++
++    #[test]
++    fn relay_counter_stays_zero_when_the_predicate_is_already_met() {
++        let before = frame_wait::RELAY_WAIT.micros();
++        relay_wait(WHY_READ, |_| true);
++        assert_eq!(frame_wait::RELAY_WAIT.micros(), before);
++    }
++
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    #[ignore = "controlled WARP run: VICTORY_D3D12_WARP=1 VICTORY_PREFIX_SETTLE=1"]
++    fn warp_prefix_lands_a_once_while_disjoint_b_stays_blocked() {
++        assert!(enabled() && relay());
++        frame_wait::start_worker(false);
++        let relay_before = frame_wait::RELAY_WAIT.micros();
++        let host = host().expect("WARP host");
++        settle_now(WHY_SYNC);
++        let mut values = Box::new([0u64; 4]);
++        let address = values.as_mut_ptr() as usize;
++        let gate_a: ID3D12Fence =
++            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
++        let gate_b: ID3D12Fence =
++            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
++        struct Release(ID3D12Fence, ID3D12Fence);
++        impl Drop for Release {
++            fn drop(&mut self) {
++                unsafe {
++                    self.0.Signal(1).unwrap();
++                    self.1.Signal(1).unwrap();
++                }
++            }
++        }
++        let release = Release(gate_a.clone(), gate_b.clone());
++        unsafe { host.queue.Wait(&gate_a, 1) }.unwrap();
++        let a = host.new_list().unwrap();
++        a.defer_write(address as *mut u8, crate::queue::Written::Value(0x1234), 8);
++        a.close();
++        let number_a = host.execute_own(&a, None);
++        unsafe { host.queue.Wait(&gate_b, 1) }.unwrap();
++        let b = host.new_list().unwrap();
++        b.defer_write(
++            (address + 8) as *mut u8,
++            crate::queue::Written::Value(0x5678),
++            8,
++        );
++        b.close();
++        let number_b = host.execute_own(&b, None);
++        assert!(number_b > number_a && number_a > 0);
++        let unrelated = host.new_list().unwrap();
++        unrelated.defer_fill((address + 24) as *mut u8, (address + 16) as *const u8, 8);
++        let reader = host.new_list().unwrap();
++        reader.defer_fill((address + 24) as *mut u8, address as *const u8, 8);
++        let mut submitted = frame_wait::lock(&host.submitted);
++        let mut settled = 0;
++        let before = LATE_STATS[1].load(Ordering::Relaxed);
++        host.settle_reads(
++            &mut submitted,
++            &[&unrelated],
++            &Default::default(),
++            WHY_READ,
++            &mut settled,
++        );
++        assert_eq!(settled, 0);
++        assert_eq!(LATE_STATS[1].load(Ordering::Relaxed), before);
++        drop(submitted);
++        reader.close();
++        std::thread::scope(|scope| {
++            scope.spawn(|| {
++                let started = std::time::Instant::now();
++                while LATE_STATS[1].load(Ordering::Relaxed) == before
++                    && started.elapsed() < std::time::Duration::from_secs(2)
++                {
++                    std::thread::yield_now();
++                }
++                unsafe { gate_a.Signal(1) }.unwrap();
++            });
++            // Exercise submit itself with the same recording named twice.
++            // Legacy line.written is empty: A only has a bottom-of-pipe write.
++            host.execute_late(vec![crate::list::Detached::for_test(reader)], vec![0, 0]);
++        });
++        assert_eq!(
++            unsafe { ((address + 24) as *const u64).read_volatile() },
++            0x1234
++        );
++        assert_eq!(LATE_STATS[1].load(Ordering::Relaxed), before + 1);
++        assert!(frame_wait::RELAY_WAIT.micros() > relay_before);
++        let mut submitted = frame_wait::lock(&host.submitted);
++        settled = number_a;
++        let again = host.new_list().unwrap();
++        again.defer_fill((address + 24) as *mut u8, address as *const u8, 8);
++        host.settle_reads(
++            &mut submitted,
++            &[&again, &again],
++            &Default::default(),
++            WHY_READ,
++            &mut settled,
++        );
++        assert_eq!(LATE_STATS[1].load(Ordering::Relaxed), before + 1);
++        assert!(line().prefix.landed_through < number_b);
++        assert_eq!(unsafe { (address as *const u64).read_volatile() }, 0x1234);
++        assert_eq!(unsafe { ((address + 8) as *const u64).read_volatile() }, 0);
++        drop(release);
++        host.settle(&mut submitted, WHY_SYNC);
++        assert_eq!(&values[..2], &[0x1234, 0x5678]);
++    }
++
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    #[ignore = "controlled WARP run: compare VICTORY_PREFIX_SETTLE=0 and 1"]
++    fn warp_full_settle_has_identical_bytes_in_both_arms() {
++        let host = host().expect("WARP host");
++        settle_now(WHY_SYNC);
++        let mut bytes = Box::new([0u64; 32]);
++        let address = bytes.as_mut_ptr();
++        let a = host.new_list().unwrap();
++        let b = host.new_list().unwrap();
++        for i in 0..32 {
++            let list = if i < 16 { &a } else { &b };
++            list.defer_write(
++                unsafe { address.add(i) }.cast(),
++                crate::queue::Written::Value((i as u64) ^ 0xabc),
++                8,
++            );
++        }
++        a.close();
++        b.close();
++        host.execute_own(&a, None);
++        host.execute_own(&b, None);
++        settle_now(WHY_SYNC);
++        assert_eq!(*bytes, std::array::from_fn(|i| (i as u64) ^ 0xabc));
++        println!("prefix={} bytes={:x?}", enabled(), bytes);
++    }
++}
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 84ea2c3..dc0e41a 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -281,6 +281,7 @@ pub(crate) fn gone(window: bool, start: u64, bytes: u64) {
+ /// the runtime to call before the title's own `VirtualFree` once it takes
+ /// that call over.
+ pub fn title_memory_freeing(at: usize, len: usize) {
++    crate::watch::invalidate_mapping_proofs();
+     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+         return;
+     }
+@@ -458,6 +459,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+ /// The runtime mapped `[at, at + len)` as a view of `section` from
+ /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
+ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
++    crate::watch::invalidate_mapping_proofs();
+     {
+         let mut v = views();
+         pool::changed();
+diff --git a/crates/victory-gpu/src/memory.rs b/crates/victory-gpu/src/memory.rs
+index 2bd0e74..5044d60 100644
+--- a/crates/victory-gpu/src/memory.rs
++++ b/crates/victory-gpu/src/memory.rs
+@@ -262,6 +262,9 @@ pub(crate) fn ready(
+     constants: &[u32],
+     writes: bool,
+ ) -> Option<Ready> {
++    if writes {
++        list.incomplete_writes();
++    }
+     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+     if guard.is_none() {
+         *guard = Memory::new();
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index 883addb..ac30fa4 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -561,6 +561,20 @@ fn drained() {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn pipeline_counter_is_zero_without_waiting_and_records_a_pending_wait() {
++        let ready = Pending::new(Vec::new(), None);
++        assert!(ready.made.set(None).is_ok());
++        let before = crate::monitor::PIPELINE_WAIT.micros();
++        wait(&ready, u64::MAX - 2);
++        assert_eq!(crate::monitor::PIPELINE_WAIT.micros(), before);
++        let pending = Pending::new(Vec::new(), None);
++        wait(&pending, u64::MAX - 1);
++        if !wait_budget().is_zero() {
++            assert!(crate::monitor::PIPELINE_WAIT.micros() > before);
++        }
++    }
++
+     /// A first use queues the pipeline and, within the budget, gets the
+     /// worker's answer (here: no host pipeline for no shaders).
+     #[test]
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 4d3f632..8be9034 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -2907,6 +2907,7 @@ impl Shadow {
+         // inside this one with a copy of its own, a texture in it) is not
+         // told: the card's writes are not seen by write watching.
+         if self.place.is_some() {
++            list.incomplete_writes();
+             return;
+         }
+         let len = len.min(self.left(address));
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 29fa8b0..66ad2e7 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -1327,6 +1327,15 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+ /// cannot help; not changing the mapping while such a read is under way
+ /// does.
+ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
++static MAPPING_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++pub(crate) fn mapping_epoch() -> u64 {
++    MAPPING_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(crate) fn invalidate_mapping_proofs() {
++    MAPPING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++}
+ 
+ mod scoped;
+ 
+@@ -1360,8 +1369,10 @@ pub fn title_memory_remapping_in(
+         let region = area().filter(|r| r.start < r.end).unwrap_or(scoped::ALL);
+         scoped::GATE.write(region)
+     });
++    let mapping = MAPPING.write().unwrap_or_else(|e| e.into_inner());
++    invalidate_mapping_proofs();
+     Remapping {
+-        _mapping: MAPPING.write().unwrap_or_else(|e| e.into_inner()),
++        _mapping: mapping,
+         _scope: scope,
+     }
+ }

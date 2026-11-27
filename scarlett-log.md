@@ -6,12 +6,19 @@ Private buffer reads remain default; constants and pool slabs require explicit o
 Constant rebinding uses immutable flight snapshots; mutable-page CBVs were removed.
 Title timing, capture comparison and hardware-vendor costs remain unverified.
 Broader diagnostics depth-bounds/stack-walker issues from 0065 remain unresolved.
-Current response and checks: [Lane A round 2](docs/uma-0066.md).
+Blocked-time counters landed; prefix settle is default-off: [0073](docs/submission-0073.md).
 External-data measurement protocol remains in [0065](docs/uma-0065.md).
 Removal preservation is opt-in; live title resume remains unsupported.
 Removal checks and limits: [0069](docs/removal-0069.md); suspended forensic capture only.
 
 ## Sessions
+
+### 2026-11-26 (6) — Exposed blockers before gated prefix settlement
+<!-- session: lane-a-0073-20261126-5e8a -->
+- DONE: Ordered 0073 patches; 66 product, 293 GPU tests and 10 focused WARP checks passed; series matches. [Evidence](docs/submission-0073.md).
+- DECIDED: Default-off prefix; retain writers through publication; incomplete sets use full settle.
+- UNVERIFIED: Title timing/captures; workspace shader/policy and Clippy baseline failures remain.
+- NEXT: Three matched 300-second runs per arm and separate deterministic captures before enablement.
 
 ### 2026-11-26 (5) — Repaired forensic deadline arithmetic and hashing
 <!-- session: lane-a-0069-20261126-c728 -->
